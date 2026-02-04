@@ -5,9 +5,12 @@ import os
 import time
 import smtplib
 from email.message import EmailMessage
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
+# --- TECHNICAL CALCULATIONS ---
 def calculate_indicators(df):
-    """Calculates technical indicators (ADX, SMA, etc.) on the dataframe."""
     df = df.copy()
     df['UpMove'] = df['High'] - df['High'].shift(1)
     df['DownMove'] = df['Low'].shift(1) - df['Low']
@@ -26,162 +29,150 @@ def calculate_indicators(df):
     return df
 
 def get_market_tide():
-    """Checks SPY to determine if the market is safe to trade."""
     try:
         spy = yf.Ticker("SPY").history(period="50d")
-        if spy.empty: return True, "SPY Data Unavailable"
         spy_sma20 = spy['Close'].rolling(window=20).mean().iloc[-1]
         current_spy = spy['Close'].iloc[-1]
-        if current_spy < spy_sma20:
-            return False, f"Market Tide is LOW (SPY {current_spy:.2f} < {spy_sma20:.2f})"
-        return True, "Market Tide is Healthy"
+        return current_spy >= spy_sma20, f"SPY: {current_spy:.2f} (SMA20: {spy_sma20:.2f})"
     except:
-        return True, "Market Tide Check Failed"
+        return True, "Market Tide check failed, proceeding."
 
-def run_hybrid_scan(ticker_file="tickers.txt"):
-    all_results = []
+# --- TRADING EXECUTION ---
+def execute_alpaca_trades(winning_df):
+    api_key = os.environ.get('ALPACA_API_KEY')
+    secret_key = os.environ.get('ALPACA_SECRET_KEY')
     
-    # 1. Tide Check
-    tide_ok, tide_msg = get_market_tide()
-    # Note: We continue even if tide is low, but the email will warn us.
+    # Change paper=True to False when ready for real money
+    client = TradingClient(api_key, secret_key, paper=True)
+    
+    account = client.get_account()
+    equity = float(account.equity)
+    
+    # POSITION SIZING LOGIC
+    MAX_SETUPS = 20
+    MAX_CASH_PER_STOCK = 5000.00
+    
+    # Divide total equity by number of hits (up to 20)
+    num_setups = min(len(winning_df), MAX_SETUPS)
+    if num_setups == 0: return "No setups to trade."
+    
+    raw_slot_size = equity / num_setups
+    final_slot_size = min(raw_slot_size, MAX_CASH_PER_STOCK)
+    
+    log_trades = []
+    
+    # Sort by Win Rate and pick top 20
+    top_picks = winning_df.sort_values(by="win_rate_3d", ascending=False).head(MAX_SETUPS)
+    
+    for _, stock in top_picks.iterrows():
+        symbol = stock['ticker']
+        price = stock['price']
+        qty = int(final_slot_size / price)
+        
+        if qty > 0:
+            try:
+                order_data = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                    order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=round(price * 1.03, 2)),
+                    stop_loss=StopLossRequest(stop_price=round(price * 0.99, 2))
+                )
+                client.submit_order(order_data)
+                log_trades.append(f"Bought {qty} {symbol} @ {price}")
+            except Exception as e:
+                log_trades.append(f"Error {symbol}: {e}")
+                
+    return "\n".join(log_trades)
 
-    if not os.path.exists(ticker_file):
-        return pd.DataFrame(), f"Error: {ticker_file} not found."
+# --- EMAIL REPORTING ---
+def send_report(df, status_msg, trade_log):
+    msg = EmailMessage()
+    user = os.environ.get('EMAIL_USER')
+    receiver = os.environ.get('EMAIL_RECEIVER')
+    
+    subject = f"🎯 Sniper Report: {len(df)} Setups" if not df.empty else "⚪ Sniper Report: Zero Hits"
+    
+    body = f"""
+    <html><body>
+    <h2>Trading System Report</h2>
+    <p><b>Market Tide:</b> {status_msg}</p>
+    <hr>
+    <h3>Execution Log:</h3>
+    <pre>{trade_log}</pre>
+    <hr>
+    <h3>Scanned Setups:</h3>
+    {df.to_html(index=False) if not df.empty else "<p>No stocks met criteria.</p>"}
+    </body></html>
+    """
+    msg.add_alternative(body, subtype='html')
+    msg['Subject'] = subject
+    msg['From'] = user
+    msg['To'] = receiver
+    
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login(user, os.environ.get('EMAIL_PASS'))
+        smtp.send_message(msg)
 
+# --- MAIN ENGINE ---
+def run_scanner():
+    ticker_file = "tickers.txt"
+    if not os.path.exists(ticker_file): return
+    
     with open(ticker_file, 'r') as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    print(f"Loaded {len(all_tickers)} tickers. Starting Hybrid Batch Scan...")
-
-    # 2. BATCH SETTINGS
-    BATCH_SIZE = 100  # Scans 100 stocks in 1 request
+    tide_ok, tide_msg = get_market_tide()
+    all_results = []
     
+    # Batch Processing to prevent Timeouts/Rate Limits
+    BATCH_SIZE = 100
     for i in range(0, len(all_tickers), BATCH_SIZE):
         batch = all_tickers[i:i+BATCH_SIZE]
-        print(f"Processing Batch {i}-{i+len(batch)} / {len(all_tickers)}...")
-        
         try:
-            # BULK DOWNLOAD (The speed secret)
-            # auto_adjust=True fixes split/dividend data issues
             data = yf.download(batch, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True)
-            
-            # Iterate through the batch
             for symbol in batch:
                 try:
-                    # Handle Single Ticker vs Multi-Ticker return structure
-                    if len(batch) == 1:
-                        df = data
-                    else:
-                        df = data[symbol]
-
-                    # Basic Data Validation
-                    if df.empty or len(df) < 50: continue
+                    df = data[symbol].dropna()
+                    if len(df) < 50: continue
                     
-                    # Clean bad data (NaNs)
-                    df = df.dropna(subset=['Close', 'Volume'])
-                    if df.empty: continue
-
-                    # --- FILTER 1: PRICE & VOLUME (From History) ---
                     price = df['Close'].iloc[-1]
-                    if price < 1.00: continue
+                    avg_vol = df['Volume'].iloc[-21:-1].mean()
+                    rel_vol = df['Volume'].iloc[-1] / avg_vol if avg_vol > 300000 else 0
                     
-                    # Volume Check (Using History, not .info)
-                    avg_vol_20d = df['Volume'].iloc[-21:-1].mean()
-                    if avg_vol_20d < 300_000: continue
-
-                    # --- FILTER 2: INDICATORS ---
+                    if price < 1.0 or rel_vol < 1.5: continue
+                    
                     df = calculate_indicators(df)
-                    today = df.iloc[-1]
-                    yesterday = df.iloc[-2]
-
-                    # Strategy: Price > SMA10 > SMA20 AND Rising ADX
-                    is_trending = (today['Close'] > today['SMA10']) and (today['SMA10'] > today['SMA20'])
-                    is_accelerating = (today['ADX'] > 20) and (today['ADX'] > yesterday['ADX'])
-
-                    if is_trending and is_accelerating:
-                        # --- FILTER 3: RELATIVE VOLUME ---
-                        today_vol = df['Volume'].iloc[-1]
-                        rel_vol = today_vol / avg_vol_20d if avg_vol_20d > 0 else 0
+                    today, yesterday = df.iloc[-1], df.iloc[-2]
+                    
+                    if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > 20 > yesterday['ADX'] or today['ADX'] > yesterday['ADX']):
+                        # Backtest
+                        hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (today['ADX'] > yesterday['ADX'])].index
+                        wins, total = 0, 0
+                        for d in hist:
+                            idx = df.index.get_loc(d)
+                            if idx + 3 < len(df):
+                                if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: wins += 1
+                                total += 1
                         
-                        if rel_vol >= 1.5:
-                            # --- FINAL GATE: .INFO CHECK (Only runs on winners) ---
-                            # This is where we safely call .info without timeouts
-                            try:
-                                t_info = yf.Ticker(symbol).info
-                                mkt_cap = t_info.get('marketCap', 0)
-                                if mkt_cap < 100_000_000: continue
-                            except:
-                                mkt_cap = 0 # If info fails, we might still want to see it if chart is good
+                        win_rate = (wins/total*100) if total > 0 else 0
+                        if win_rate >= 55:
+                            all_results.append({"ticker": symbol, "win_rate_3d": win_rate, "price": price})
+                except: continue
+        except: continue
 
-                            # --- BACKTEST ---
-                            hist_signals = df[(df['Close'] > df['SMA10']) & 
-                                              (df['SMA10'] > df['SMA20']) & 
-                                              (df['ADX'] > 20) & 
-                                              (df['ADX'] > df['ADX'].shift(1))].index
-                            
-                            wins, total = 0, 0
-                            total_ret = 0
-                            for date in hist_signals:
-                                idx = df.index.get_loc(date)
-                                if idx + 3 < len(df):
-                                    ret = (df.iloc[idx + 3]['Close'] - df.iloc[idx]['Close']) / df.iloc[idx]['Close']
-                                    if ret > 0: wins += 1
-                                    total_ret += ret
-                                    total += 1
-                            
-                            win_rate = (wins/total * 100) if total > 0 else 0
-                            avg_ret = (total_ret/total * 100) if total > 0 else 0
-
-                            if win_rate >= 55 and avg_ret >= 3.0:
-                                all_results.append({
-                                    "ticker": symbol,
-                                    "win_rate": f"{win_rate:.1f}%",
-                                    "exp_return": f"{avg_ret:.2f}%",
-                                    "price": round(price, 2),
-                                    "target": round(price * 1.03, 2),
-                                    "stop": round(price * 0.99, 2),
-                                    "rel_vol": round(rel_vol, 2),
-                                    "mkt_cap": f"{mkt_cap/1e6:.1f}M"
-                                })
-                except Exception as e:
-                    continue # Skip individual bad tickers in batch
-
-            # Sleep slightly between batches to be polite
-            time.sleep(0.5)
-            
-        except Exception as e:
-            print(f"Batch Failed: {e}")
-            continue
-
-    return pd.DataFrame(all_results), tide_msg
-
-def send_email(df, status):
-    msg = EmailMessage()
-    repo = os.environ.get('GITHUB_REPOSITORY', 'Scanner')
+    res_df = pd.DataFrame(all_results)
     
-    if df.empty:
-        subject = "⚪ Zero Hits: Scanner Report"
-        body = f"<h3>Status: {status}</h3><p>Scanned full list. No stocks met the 3:1 criteria.</p><p>Source: {repo}</p>"
-    else:
-        subject = f"🎯 SNIPER ALERT: {len(df)} Setups Found"
-        body = f"""
-        <html><body>
-        <h2 style="color:darkgreen">High Conviction Setups</h2>
-        <p><b>Status:</b> {status}</p>
-        {df.to_html(index=False)}
-        <p>Source: {repo}</p>
-        </body></html>
-        """
-    
-    msg.add_alternative(body, subtype='html')
-    msg['Subject'] = subject
-    msg['From'] = os.environ.get('EMAIL_USER')
-    msg['To'] = os.environ.get('EMAIL_RECEIVER')
+    # Execute Trades if Tide is Healthy
+    trade_log = "Skipped: Market Tide is LOW"
+    if tide_ok and not res_df.empty:
+        trade_log = execute_alpaca_trades(res_df)
+    elif res_df.empty:
+        trade_log = "No setups found today."
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(os.environ.get('EMAIL_USER'), os.environ.get('EMAIL_PASS'))
-        smtp.send_message(msg)
+    send_report(res_df, tide_msg, trade_log)
 
 if __name__ == "__main__":
-    res, status = run_hybrid_scan()
-    send_email(res, status)
+    run_scanner()
