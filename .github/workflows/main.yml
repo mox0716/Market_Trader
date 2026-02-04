@@ -2,7 +2,7 @@ name: Daily Market Close Sniper
 on:
   schedule:
     # 18:45 UTC and 19:45 UTC covers the 3:45 PM window for both EST and EDT
-    - cron: '45 18,19 * * 1-5'
+    - cron: '45 19,20 * * 1-5'
   workflow_dispatch:
 
 jobs:
