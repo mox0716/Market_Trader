@@ -32,7 +32,7 @@ def calculate_indicators(df):
 def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
-    client = TradingClient(api_key, secret_key, paper=True) # Change to False for live
+    client = TradingClient(api_key, secret_key, paper=True) 
     
     account = client.get_account()
     equity = float(account.equity)
@@ -41,28 +41,40 @@ def execute_alpaca_trades(winning_df):
     if equity < 30000:
         dt_count = int(account.daytrade_count)
         if dt_count >= 2:
-            return f"Trade Blocked: PDT Safeguard Active. Day Trades: {dt_count}/3."
+            return f"Trade Blocked: PDT Safeguard Active. Day Trades: {dt_count}/3.", ""
 
-    # 2. FETCH EXISTING POSITIONS (To prevent double-buying)
+    # 2. FETCH EXISTING POSITIONS
     positions = client.get_all_positions()
     existing_tickers = [p.symbol for p in positions]
     
-    # Also check for pending "buy" orders
+    # Format Portfolio Summary for Email
+    portfolio_data = []
+    for p in positions:
+        portfolio_data.append({
+            "Symbol": p.symbol,
+            "Qty": p.qty,
+            "Avg Price": round(float(p.avg_entry_price), 2),
+            "Current": round(float(p.current_price), 2),
+            "P/L $": round(float(p.unrealized_pl), 2),
+            "P/L %": f"{float(p.unrealized_pl_pc)*100:.2f}%"
+        })
+    portfolio_html = pd.DataFrame(portfolio_data).to_html(index=False) if portfolio_data else "<p>No open positions.</p>"
+
+    # 3. PENDING ORDERS CHECK
     orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY)
     open_orders = client.get_orders(filter=orders_request)
     pending_tickers = [o.symbol for o in open_orders]
-    
     excluded_tickers = set(existing_tickers + pending_tickers)
 
-    # 3. POSITION SIZING
+    # 4. POSITION SIZING
     MAX_SETUPS = 20
     MAX_CASH_PER_STOCK = 5000.00
     
-    # Filter out what we already own before calculating slot sizes
     fresh_setups = winning_df[~winning_df['ticker'].isin(excluded_tickers)]
-    
     num_setups = min(len(fresh_setups), MAX_SETUPS)
-    if num_setups == 0: return "No new setups to trade (or all already owned)."
+    
+    if num_setups == 0: 
+        return "No new setups found that aren't already in portfolio.", portfolio_html
     
     final_slot_size = min((equity / num_setups), MAX_CASH_PER_STOCK)
     
@@ -77,11 +89,8 @@ def execute_alpaca_trades(winning_df):
         if qty > 0:
             try:
                 order_data = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.GTC,
-                    order_class=OrderClass.BRACKET,
+                    symbol=symbol, qty=qty, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC, order_class=OrderClass.BRACKET,
                     take_profit=TakeProfitRequest(limit_price=round(price * 1.03, 2)),
                     stop_loss=StopLossRequest(stop_price=round(price * 0.99, 2))
                 )
@@ -90,10 +99,10 @@ def execute_alpaca_trades(winning_df):
             except Exception as e:
                 log_trades.append(f"Error {symbol}: {e}")
                 
-    return "\n".join(log_trades)
+    return "\n".join(log_trades), portfolio_html
 
 # --- EMAIL REPORTING ---
-def send_report(df, trade_log):
+def send_report(df, trade_log, portfolio_html):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
     receiver = os.environ.get('EMAIL_RECEIVER')
@@ -101,15 +110,18 @@ def send_report(df, trade_log):
     subject = f"🎯 Sniper Report: {len(df)} Setups" if not df.empty else "⚪ Sniper Report: Zero Hits"
     
     body = f"""
-    <html><body>
-    <h2>Trading System Report</h2>
-    <p><b>Market Tide:</b> BYPASSED (True)</p>
+    <html><body style="font-family: Arial, sans-serif;">
+    <h2 style="color: #2E86C1;">Daily Trading Command Center</h2>
     <hr>
-    <h3>Execution Log:</h3>
-    <pre>{trade_log}</pre>
+    <h3 style="color: #117864;">Current Portfolio Performance</h3>
+    {portfolio_html}
     <hr>
-    <h3>Scanned Setups:</h3>
-    {df.to_html(index=False) if not df.empty else "<p>No stocks met criteria.</p>"}
+    <h3 style="color: #A04000;">New Execution Log</h3>
+    <pre style="background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">{trade_log}</pre>
+    <hr>
+    <h3 style="color: #1B4F72;">Today's Scanned Setups</h3>
+    {df.to_html(index=False) if not df.empty else "<p>No new stocks met technical criteria today.</p>"}
+    <p style="font-size: 10px; color: gray;">Settings: 3:1 RR | $5k Cap | $30k PDT Shield</p>
     </body></html>
     """
     msg.add_alternative(body, subtype='html')
@@ -125,12 +137,10 @@ def send_report(df, trade_log):
 def run_scanner():
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file): return
-    
     with open(ticker_file, 'r') as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
     all_results = []
-    
     BATCH_SIZE = 100
     for i in range(0, len(all_tickers), BATCH_SIZE):
         batch = all_tickers[i:i+BATCH_SIZE]
@@ -140,12 +150,9 @@ def run_scanner():
                 try:
                     df = data[symbol].dropna()
                     if len(df) < 50: continue
-                    
                     price = df['Close'].iloc[-1]
                     avg_vol = df['Volume'].iloc[-21:-1].mean()
-                    rel_vol = df['Volume'].iloc[-1] / avg_vol if avg_vol > 300000 else 0
-                    
-                    if price < 1.0 or rel_vol < 1.5: continue
+                    if price < 1.0 or (df['Volume'].iloc[-1] / avg_vol) < 1.5 or avg_vol < 300000: continue
                     
                     df = calculate_indicators(df)
                     today, yesterday = df.iloc[-1], df.iloc[-2]
@@ -167,11 +174,27 @@ def run_scanner():
 
     res_df = pd.DataFrame(all_results)
     
-    trade_log = "No setups found today."
-    if not res_df.empty:
-        trade_log = execute_alpaca_trades(res_df)
+    # Always attempt to fetch portfolio summary even if no new trades are found
+    api_key = os.environ.get('ALPACA_API_KEY')
+    secret_key = os.environ.get('ALPACA_SECRET_KEY')
+    client = TradingClient(api_key, secret_key, paper=True)
+    
+    trade_log = "No new setups found today."
+    # Get current portfolio view
+    positions = client.get_all_positions()
+    portfolio_data = []
+    for p in positions:
+        portfolio_data.append({
+            "Symbol": p.symbol, "Qty": p.qty, "Avg Price": round(float(p.avg_entry_price), 2),
+            "Current": round(float(p.current_price), 2), "P/L $": round(float(p.unrealized_pl), 2),
+            "P/L %": f"{float(p.unrealized_pl_pc)*100:.2f}%"
+        })
+    portfolio_html = pd.DataFrame(portfolio_data).to_html(index=False) if portfolio_data else "<p>No open positions.</p>"
 
-    send_report(res_df, trade_log)
+    if not res_df.empty:
+        trade_log, portfolio_html = execute_alpaca_trades(res_df)
+
+    send_report(res_df, trade_log, portfolio_html)
 
 if __name__ == "__main__":
     run_scanner()
