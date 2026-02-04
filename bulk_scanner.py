@@ -39,7 +39,7 @@ def execute_alpaca_trades(winning_df):
     
     # --- DAY TRADE SAFEGUARD ---
     # If account < $25k, check remaining day trades
-    if equity < 25000:
+    if equity < 30000:
         # Alpaca provides 'daytrade_count' (trades in last 5 days)
         dt_count = int(account.daytrade_count)
         if dt_count >= 2: # Buffer: Stop at 2 to avoid the 3rd/4th on the same day
@@ -167,3 +167,4 @@ def run_scanner():
 
 if __name__ == "__main__":
     run_scanner()
+
