@@ -1,7 +1,7 @@
 name: Daily Market Close Scanner
 on:
   schedule:
-    - cron: '35 20 * * 1-5' # Runs at 3:35 PM EST (Mon-Fri)
+    - cron: '45 20 * * 1-5' # Runs at 3:35 PM EST (Mon-Fri)
   workflow_dispatch: # Allows you to run it manually for testing
 
 jobs:
