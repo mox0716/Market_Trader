@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.9'
       - name: Install Dependencies
-        run: pip install --upgrade yfinance pandas lxml requests pytz alpaca-py
+        run: pip install yfinance==0.2.54 pandas lxml requests pytz alpaca-py
       - name: Run Scan and Trade
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
