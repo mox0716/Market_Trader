@@ -1,8 +1,9 @@
-name: Daily Market Close Scanner
+name: Daily Market Close Sniper
 on:
   schedule:
-    - cron: '45 20 * * 1-5' # Runs at 3:35 PM EST (Mon-Fri)
-  workflow_dispatch: # Allows you to run it manually for testing
+    # 18:45 UTC and 19:45 UTC covers the 3:45 PM window for both EST and EDT
+    - cron: '45 18,19 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,9 +16,11 @@ jobs:
         with:
           python-version: '3.9'
       - name: Install Dependencies
-        run: pip install --upgrade yfinance pandas lxml requests
-      - name: Run Scan and Send Email
+        run: pip install --upgrade yfinance pandas lxml requests pytz alpaca-py
+      - name: Run Scan and Trade
         env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
