@@ -32,6 +32,7 @@ def calculate_indicators(df):
 def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
+    # SETTING 1: CHANGE paper=True to False for LIVE
     client = TradingClient(api_key, secret_key, paper=True) 
     
     account = client.get_account()
@@ -47,12 +48,10 @@ def execute_alpaca_trades(winning_df):
     positions = client.get_all_positions()
     existing_tickers = [p.symbol for p in positions]
     
-    # Format Portfolio Summary for Email
     portfolio_data = []
     for p in positions:
         portfolio_data.append({
-            "Symbol": p.symbol,
-            "Qty": p.qty,
+            "Symbol": p.symbol, "Qty": p.qty,
             "Avg Price": round(float(p.avg_entry_price), 2),
             "Current": round(float(p.current_price), 2),
             "P/L $": round(float(p.unrealized_pl), 2),
@@ -74,7 +73,7 @@ def execute_alpaca_trades(winning_df):
     num_setups = min(len(fresh_setups), MAX_SETUPS)
     
     if num_setups == 0: 
-        return "No new setups found that aren't already in portfolio.", portfolio_html
+        return "No new setups found (or all already owned).", portfolio_html
     
     final_slot_size = min((equity / num_setups), MAX_CASH_PER_STOCK)
     
@@ -102,7 +101,7 @@ def execute_alpaca_trades(winning_df):
     return "\n".join(log_trades), portfolio_html
 
 # --- EMAIL REPORTING ---
-def send_report(df, trade_log, portfolio_html):
+def send_report(df, trade_log, portfolio_html, account_summary):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
     receiver = os.environ.get('EMAIL_RECEIVER')
@@ -112,15 +111,23 @@ def send_report(df, trade_log, portfolio_html):
     body = f"""
     <html><body style="font-family: Arial, sans-serif;">
     <h2 style="color: #2E86C1;">Daily Trading Command Center</h2>
-    <hr>
+    
+    <div style="background-color: #f9f9f9; padding: 15px; border-radius: 5px; border: 1px solid #ddd;">
+        <h3 style="margin-top: 0; color: #283747;">Account Overview</h3>
+        <p><b>Total Equity:</b> <span style="color: #117864; font-size: 1.2em;">${account_summary['equity']}</span></p>
+        <p><b>Buying Power:</b> ${account_summary['buying_power']}</p>
+        <p><b>Account Type:</b> {account_summary['mode']}</p>
+    </div>
+
     <h3 style="color: #117864;">Current Portfolio Performance</h3>
     {portfolio_html}
-    <hr>
+    
     <h3 style="color: #A04000;">New Execution Log</h3>
     <pre style="background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">{trade_log}</pre>
-    <hr>
+    
     <h3 style="color: #1B4F72;">Today's Scanned Setups</h3>
     {df.to_html(index=False) if not df.empty else "<p>No new stocks met technical criteria today.</p>"}
+    
     <p style="font-size: 10px; color: gray;">Settings: 3:1 RR | $5k Cap | $30k PDT Shield</p>
     </body></html>
     """
@@ -174,13 +181,20 @@ def run_scanner():
 
     res_df = pd.DataFrame(all_results)
     
-    # Always attempt to fetch portfolio summary even if no new trades are found
+    # FETCH ACCOUNT INFO
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
+    # SETTING 2: CHANGE paper=True to False for LIVE
     client = TradingClient(api_key, secret_key, paper=True)
     
+    account = client.get_account()
+    account_summary = {
+        "equity": f"{float(account.equity):,.2f}",
+        "buying_power": f"{float(account.buying_power):,.2f}",
+        "mode": "PAPER" if client.paper else "LIVE"
+    }
+    
     trade_log = "No new setups found today."
-    # Get current portfolio view
     positions = client.get_all_positions()
     portfolio_data = []
     for p in positions:
@@ -194,7 +208,7 @@ def run_scanner():
     if not res_df.empty:
         trade_log, portfolio_html = execute_alpaca_trades(res_df)
 
-    send_report(res_df, trade_log, portfolio_html)
+    send_report(res_df, trade_log, portfolio_html, account_summary)
 
 if __name__ == "__main__":
     run_scanner()
