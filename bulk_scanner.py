@@ -28,40 +28,33 @@ def calculate_indicators(df):
     df['SMA20'] = df['Close'].rolling(20).mean()
     return df
 
-def get_market_tide():
-    try:
-        spy = yf.Ticker("SPY").history(period="50d")
-        spy_sma20 = spy['Close'].rolling(window=20).mean().iloc[-1]
-        current_spy = spy['Close'].iloc[-1]
-        return current_spy >= spy_sma20, f"SPY: {current_spy:.2f} (SMA20: {spy_sma20:.2f})"
-    except:
-        return True, "Market Tide check failed, proceeding."
-
 # --- TRADING EXECUTION ---
 def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
-    
-    # Change paper=True to False when ready for real money
-    client = TradingClient(api_key, secret_key, paper=True)
+    client = TradingClient(api_key, secret_key, paper=True) # Change to paper=False for live
     
     account = client.get_account()
     equity = float(account.equity)
     
-    # POSITION SIZING LOGIC
+    # --- DAY TRADE SAFEGUARD ---
+    # If account < $25k, check remaining day trades
+    if equity < 25000:
+        # Alpaca provides 'daytrade_count' (trades in last 5 days)
+        dt_count = int(account.daytrade_count)
+        if dt_count >= 2: # Buffer: Stop at 2 to avoid the 3rd/4th on the same day
+            return f"Trade Blocked: PDT Safeguard Active. Current Day Trades: {dt_count}/3 allowed."
+
+    # POSITION SIZING
     MAX_SETUPS = 20
     MAX_CASH_PER_STOCK = 5000.00
     
-    # Divide total equity by number of hits (up to 20)
     num_setups = min(len(winning_df), MAX_SETUPS)
     if num_setups == 0: return "No setups to trade."
     
-    raw_slot_size = equity / num_setups
-    final_slot_size = min(raw_slot_size, MAX_CASH_PER_STOCK)
+    final_slot_size = min((equity / num_setups), MAX_CASH_PER_STOCK)
     
     log_trades = []
-    
-    # Sort by Win Rate and pick top 20
     top_picks = winning_df.sort_values(by="win_rate_3d", ascending=False).head(MAX_SETUPS)
     
     for _, stock in top_picks.iterrows():
@@ -88,7 +81,7 @@ def execute_alpaca_trades(winning_df):
     return "\n".join(log_trades)
 
 # --- EMAIL REPORTING ---
-def send_report(df, status_msg, trade_log):
+def send_report(df, trade_log):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
     receiver = os.environ.get('EMAIL_RECEIVER')
@@ -98,7 +91,7 @@ def send_report(df, status_msg, trade_log):
     body = f"""
     <html><body>
     <h2>Trading System Report</h2>
-    <p><b>Market Tide:</b> {status_msg}</p>
+    <p><b>Market Tide:</b> BYPASSED (True)</p>
     <hr>
     <h3>Execution Log:</h3>
     <pre>{trade_log}</pre>
@@ -124,10 +117,9 @@ def run_scanner():
     with open(ticker_file, 'r') as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
-    tide_ok, tide_msg = get_market_tide()
     all_results = []
     
-    # Batch Processing to prevent Timeouts/Rate Limits
+    # Batch Processing
     BATCH_SIZE = 100
     for i in range(0, len(all_tickers), BATCH_SIZE):
         batch = all_tickers[i:i+BATCH_SIZE]
@@ -147,9 +139,10 @@ def run_scanner():
                     df = calculate_indicators(df)
                     today, yesterday = df.iloc[-1], df.iloc[-2]
                     
-                    if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > 20 > yesterday['ADX'] or today['ADX'] > yesterday['ADX']):
+                    # Trend + ADX Rising
+                    if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
                         # Backtest
-                        hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (today['ADX'] > yesterday['ADX'])].index
+                        hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
                         wins, total = 0, 0
                         for d in hist:
                             idx = df.index.get_loc(d)
@@ -159,20 +152,18 @@ def run_scanner():
                         
                         win_rate = (wins/total*100) if total > 0 else 0
                         if win_rate >= 55:
-                            all_results.append({"ticker": symbol, "win_rate_3d": win_rate, "price": price})
+                            all_results.append({"ticker": symbol, "win_rate_3d": round(win_rate, 2), "price": round(price, 2)})
                 except: continue
         except: continue
 
     res_df = pd.DataFrame(all_results)
     
-    # Execute Trades if Tide is Healthy
-    trade_log = "Skipped: Market Tide is LOW"
-    if tide_ok and not res_df.empty:
+    # EXECUTION BLOCK (Always runs because of your True bypass)
+    trade_log = "No setups found today."
+    if not res_df.empty:
         trade_log = execute_alpaca_trades(res_df)
-    elif res_df.empty:
-        trade_log = "No setups found today."
 
-    send_report(res_df, tide_msg, trade_log)
+    send_report(res_df, trade_log)
 
 if __name__ == "__main__":
     run_scanner()
