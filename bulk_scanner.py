@@ -6,8 +6,8 @@ import time
 import smtplib
 from email.message import EmailMessage
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 
 # --- TECHNICAL CALCULATIONS ---
 def calculate_indicators(df):
@@ -32,30 +32,42 @@ def calculate_indicators(df):
 def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
-    client = TradingClient(api_key, secret_key, paper=True) # Change to paper=False for live
+    client = TradingClient(api_key, secret_key, paper=True) # Change to False for live
     
     account = client.get_account()
     equity = float(account.equity)
     
-    # --- DAY TRADE SAFEGUARD ---
-    # If account < $25k, check remaining day trades
+    # 1. DAY TRADE SAFEGUARD ($30k Threshold)
     if equity < 30000:
-        # Alpaca provides 'daytrade_count' (trades in last 5 days)
         dt_count = int(account.daytrade_count)
-        if dt_count >= 2: # Buffer: Stop at 2 to avoid the 3rd/4th on the same day
-            return f"Trade Blocked: PDT Safeguard Active. Current Day Trades: {dt_count}/3 allowed."
+        if dt_count >= 2:
+            return f"Trade Blocked: PDT Safeguard Active. Day Trades: {dt_count}/3."
 
-    # POSITION SIZING
+    # 2. FETCH EXISTING POSITIONS (To prevent double-buying)
+    positions = client.get_all_positions()
+    existing_tickers = [p.symbol for p in positions]
+    
+    # Also check for pending "buy" orders
+    orders_request = GetOrdersRequest(status=QueryOrderStatus.OPEN, side=OrderSide.BUY)
+    open_orders = client.get_orders(filter=orders_request)
+    pending_tickers = [o.symbol for o in open_orders]
+    
+    excluded_tickers = set(existing_tickers + pending_tickers)
+
+    # 3. POSITION SIZING
     MAX_SETUPS = 20
     MAX_CASH_PER_STOCK = 5000.00
     
-    num_setups = min(len(winning_df), MAX_SETUPS)
-    if num_setups == 0: return "No setups to trade."
+    # Filter out what we already own before calculating slot sizes
+    fresh_setups = winning_df[~winning_df['ticker'].isin(excluded_tickers)]
+    
+    num_setups = min(len(fresh_setups), MAX_SETUPS)
+    if num_setups == 0: return "No new setups to trade (or all already owned)."
     
     final_slot_size = min((equity / num_setups), MAX_CASH_PER_STOCK)
     
     log_trades = []
-    top_picks = winning_df.sort_values(by="win_rate_3d", ascending=False).head(MAX_SETUPS)
+    top_picks = fresh_setups.sort_values(by="win_rate_3d", ascending=False).head(MAX_SETUPS)
     
     for _, stock in top_picks.iterrows():
         symbol = stock['ticker']
@@ -119,7 +131,6 @@ def run_scanner():
 
     all_results = []
     
-    # Batch Processing
     BATCH_SIZE = 100
     for i in range(0, len(all_tickers), BATCH_SIZE):
         batch = all_tickers[i:i+BATCH_SIZE]
@@ -139,9 +150,7 @@ def run_scanner():
                     df = calculate_indicators(df)
                     today, yesterday = df.iloc[-1], df.iloc[-2]
                     
-                    # Trend + ADX Rising
                     if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
-                        # Backtest
                         hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
                         wins, total = 0, 0
                         for d in hist:
@@ -158,7 +167,6 @@ def run_scanner():
 
     res_df = pd.DataFrame(all_results)
     
-    # EXECUTION BLOCK (Always runs because of your True bypass)
     trade_log = "No setups found today."
     if not res_df.empty:
         trade_log = execute_alpaca_trades(res_df)
@@ -167,4 +175,3 @@ def run_scanner():
 
 if __name__ == "__main__":
     run_scanner()
-
