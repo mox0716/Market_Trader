@@ -8,8 +8,8 @@ from datetime import datetime
 import pytz
 from email.message import EmailMessage
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # --- 1. THE BOUNCER (Time Gate) ---
 def is_market_closing_soon():
@@ -48,7 +48,10 @@ def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     
-    # IMPORTANT: Keep paper=True until you are ready to risk real money!
+    if not api_key or not secret_key:
+        raise ValueError("Alpaca API credentials missing from Environment Variables.")
+    
+    # IMPORTANT: paper=True is set here
     client = TradingClient(api_key, secret_key, paper=True) 
     
     # Maintenance: Clear yesterday's leftover orders
@@ -108,7 +111,12 @@ def execute_alpaca_trades(winning_df):
 def send_email(res_df, trade_log, port_html, ny_time):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
+    password = os.environ.get('EMAIL_PASS')
+    receiver = os.environ.get('EMAIL_RECEIVER')
     
+    if not user or not password or not receiver:
+         raise ValueError("Email credentials missing from Environment Variables.")
+
     subject = f"Sniper Report: {len(res_df)} Hits" if not res_df.empty else "Sniper Report: No Trades"
     
     body = f"""
@@ -132,22 +140,26 @@ def send_email(res_df, trade_log, port_html, ny_time):
     msg.add_alternative(body, subtype='html')
     msg['Subject'] = subject
     msg['From'] = user
-    msg['To'] = os.environ.get('EMAIL_RECEIVER')
+    msg['To'] = receiver
     
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(user, os.environ.get('EMAIL_PASS'))
+        smtp.login(user, password)
         smtp.send_message(msg)
 
-# --- 5. MAIN LOGIC ---
+# --- 5. MAIN LOGIC (UPDATED FOR SAFETY) ---
 def run_main():
     # 1. Check Time
     is_time, ny_time = is_market_closing_soon()
-    if not is_time:
-        print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
-        return
+    # UNCOMMENT THE NEXT TWO LINES TO ENFORCE TIME GATE
+    # if not is_time:
+    #     print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
+    #     return
 
     ticker_file = "tickers.txt"
-    if not os.path.exists(ticker_file): return
+    if not os.path.exists(ticker_file):
+        print("ERROR: tickers.txt file not found.")
+        return
+        
     with open(ticker_file, 'r') as f:
         tickers = [line.strip().upper() for line in f if line.strip()]
 
@@ -163,6 +175,7 @@ def run_main():
     hits = []
     
     # 3. Process Tickers
+    print(f"Scanning {len(tickers)} tickers...")
     for i, symbol in enumerate(tickers):
         try:
             # Handle MultiIndex logic
@@ -207,14 +220,31 @@ def run_main():
                             "win_rate": round(real_win_rate, 1), 
                             "price": round(price, 2)
                         })
-        except:
+        except Exception:
             continue
 
     res_df = pd.DataFrame(hits)
+    print(f"Scan complete. Found {len(res_df)} hits.")
     
     # 4. Execute & Report
-    trade_log, port_html = execute_alpaca_trades(res_df)
-    send_email(res_df, trade_log, port_html, ny_time)
+    # We use try/except blocks here so one failure doesn't crash the whole script
+    trade_log = "Trade Execution Skipped (Error)"
+    port_html = "<p>Portfolio Data Unavailable</p>"
+
+    try:
+        print("Attempting to execute trades...")
+        trade_log, port_html = execute_alpaca_trades(res_df)
+        print("Trades processed successfully.")
+    except Exception as e:
+        print(f"CRITICAL ALPACA ERROR: {e}")
+        trade_log = f"Alpaca Failed: {e}"
+
+    try:
+        print("Attempting to send email...")
+        send_email(res_df, trade_log, port_html, ny_time)
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"CRITICAL EMAIL ERROR: {e}")
 
 if __name__ == "__main__":
     run_main()
