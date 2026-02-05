@@ -151,9 +151,9 @@ def run_main():
     # 1. Check Time
     is_time, ny_time = is_market_closing_soon()
     # UNCOMMENT THE NEXT TWO LINES TO ENFORCE TIME GATE
-    # if not is_time:
-    #     print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
-    #     return
+    if not is_time:
+        print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
+        return
 
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file):
@@ -248,3 +248,4 @@ def run_main():
 
 if __name__ == "__main__":
     run_main()
+
