@@ -16,11 +16,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          # UPDATED: Changed from 3.9 to 3.12 to support pandas_ta
+          python-version: '3.12'
 
       - name: Install Dependencies
-        # Added pandas_ta. Keeping yfinance pinned for stability.
-        run: pip install yfinance==0.2.54 pandas lxml requests pytz alpaca-py pandas_ta
+        # UPDATED: Using pandas-ta (hyphen) and pinned yfinance
+        run: pip install yfinance==0.2.54 pandas lxml requests pytz alpaca-py pandas-ta
         
       - name: Run Scan and Trade
         env:
