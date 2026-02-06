@@ -2,8 +2,7 @@ name: Daily Market Close Sniper
 
 on:
   schedule:
-    # Runs every 15 mins from 18:00 UTC to 21:45 UTC
-    # Covers the 3:45 PM NY open in both Winter (Standard) and Summer (DST)
+    # Shotgun Schedule: Runs every 15 mins to hit the 3:45 PM window reliably
     - cron: '*/15 18-21 * * 1-5'
   workflow_dispatch:
 
@@ -20,9 +19,9 @@ jobs:
           python-version: '3.9'
 
       - name: Install Dependencies
-        # Added numpy explicitly just to be safe
-        run: pip install yfinance==0.2.54 pandas numpy lxml requests pytz alpaca-py
-
+        # Added pandas_ta. Keeping yfinance pinned for stability.
+        run: pip install yfinance==0.2.54 pandas lxml requests pytz alpaca-py pandas_ta
+        
       - name: Run Scan and Trade
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
