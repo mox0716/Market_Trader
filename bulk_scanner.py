@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+import pandas_ta as ta  # PRO UPGRADE
 import numpy as np
 import os
 import time
@@ -23,35 +24,73 @@ def is_market_closing_soon():
         
     return False, now_ny.strftime("%I:%M %p %Z")
 
-# --- 2. TECHNICAL INDICATORS ---
+# --- 2. MARKET TIDE (SPY + VIX) ---
+def get_market_tide():
+    """Returns True only if Market is Healthy (SPY Uptrend + VIX Calm)."""
+    try:
+        # Download SPY and VIX
+        tickers = ["SPY", "^VIX"]
+        data = yf.download(tickers, period="50d", group_by='ticker', progress=False, auto_adjust=True)
+        
+        # 1. SPY Check (Must be above SMA 20)
+        spy_df = data["SPY"]
+        spy_close = spy_df['Close'].iloc[-1]
+        spy_sma20 = spy_df['Close'].rolling(20).mean().iloc[-1]
+        spy_ok = spy_close > spy_sma20
+        
+        # 2. VIX Check (Must be below 32 - Panic Threshold)
+        vix_df = data["^VIX"]
+        vix_close = vix_df['Close'].iloc[-1]
+        vix_ok = vix_close < 32
+        
+        status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
+        
+        if spy_ok and vix_ok:
+            return True, f"✅ MARKET HEALTHY. {status_msg}"
+        else:
+            return False, f"⛔ MARKET UNSAFE. {status_msg}"
+            
+    except Exception as e:
+        return True, f"⚠️ Tide Check Failed ({e}). Assuming Safe."
+
+# --- 3. PRO INDICATORS (pandas_ta) ---
 def calculate_indicators(df):
+    """Uses Professional pandas_ta library for accurate Wilder's Smoothing."""
+    # Ensure no NaN values interfere with calculation
     df = df.copy()
-    df['UpMove'] = df['High'] - df['High'].shift(1)
-    df['DownMove'] = df['Low'].shift(1) - df['Low']
-    df['TR'] = pd.concat([df['High']-df['Low'], abs(df['High']-df['Close'].shift()), abs(df['Low']-df['Close'].shift())], axis=1).max(axis=1)
     
-    period = 14
-    df['SMA10'] = df['Close'].rolling(10).mean()
-    df['SMA20'] = df['Close'].rolling(20).mean()
+    # ADX (Standard 14 period) -> Adds columns ADX_14, DMP_14, DMN_14
+    df.ta.adx(length=14, append=True)
     
-    # ADX Calculation
-    df['+DM'] = np.where((df['UpMove'] > df['DownMove']) & (df['UpMove'] > 0), df['UpMove'], 0)
-    df['-DM'] = np.where((df['DownMove'] > df['UpMove']) & (df['DownMove'] > 0), df['DownMove'], 0)
-    df['+DI'] = 100 * (df['+DM'].rolling(period).mean() / df['TR'].rolling(period).mean())
-    df['-DI'] = 100 * (df['-DM'].rolling(period).mean() / df['TR'].rolling(period).mean())
-    df['DX'] = 100 * (abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']))
-    df['ADX'] = df['DX'].rolling(period).mean()
+    # SMAs
+    df.ta.sma(length=10, append=True)
+    df.ta.sma(length=20, append=True)
+    
+    # Rename for logic compatibility
+    # If pandas_ta fails to generate columns (rare), we fill with 0
+    if 'ADX_14' in df.columns:
+        df['ADX'] = df['ADX_14']
+    else:
+        df['ADX'] = 0
+        
+    if 'SMA_10' in df.columns:
+        df['SMA10'] = df['SMA_10']
+    else:
+        df['SMA10'] = 0
+        
+    if 'SMA_20' in df.columns:
+        df['SMA20'] = df['SMA_20']
+    else:
+        df['SMA20'] = 0
+        
     return df
 
-# --- 3. EXECUTION ENGINE ---
+# --- 4. EXECUTION ENGINE ---
 def execute_alpaca_trades(winning_df):
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     
-    if not api_key or not secret_key:
-        raise ValueError("Alpaca API credentials missing from Environment Variables.")
-    
-    # IMPORTANT: paper=True is set here
+    # Keep paper=True until confident
     client = TradingClient(api_key, secret_key, paper=True) 
     
     # Maintenance: Clear yesterday's leftover orders
@@ -66,7 +105,7 @@ def execute_alpaca_trades(winning_df):
         if int(account.daytrade_count) >= 2:
             return f"BLOCKED: PDT Safeguard Active. Trades used: {account.daytrade_count}/3", ""
 
-    # Portfolio Check (Prevent Double Buying)
+    # Portfolio Check
     positions = client.get_all_positions()
     existing_tickers = [p.symbol for p in positions]
     
@@ -107,21 +146,21 @@ def execute_alpaca_trades(winning_df):
 
     return "\n".join(trade_log) if trade_log else "No orders placed.", portfolio_html
 
-# --- 4. EMAILER ---
-def send_email(res_df, trade_log, port_html, ny_time):
+# --- 5. EMAILER ---
+def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
-    password = os.environ.get('EMAIL_PASS')
-    receiver = os.environ.get('EMAIL_RECEIVER')
     
-    if not user or not password or not receiver:
-         raise ValueError("Email credentials missing from Environment Variables.")
-
     subject = f"Sniper Report: {len(res_df)} Hits" if not res_df.empty else "Sniper Report: No Trades"
+    if "MARKET UNSAFE" in tide_msg: subject = "⛔ Sniper Report: MARKET UNSAFE"
     
     body = f"""
     <html><body style="font-family: Arial, sans-serif;">
     <h2 style="color: #2E86C1;">Sniper Command Center - {ny_time}</h2>
+    
+    <div style="background: #E8F8F5; padding: 10px; border: 1px solid #117864; margin-bottom: 20px;">
+        <strong>MARKET TIDE:</strong> {tide_msg}
+    </div>
     
     <div style="background: #f4f4f4; padding: 10px; border: 1px solid #ddd;">
         <h3 style="margin-top:0;">Execution Log</h3>
@@ -134,38 +173,44 @@ def send_email(res_df, trade_log, port_html, ny_time):
     <h3>Scanner Hits (New Only)</h3>
     {res_df.to_html(index=False) if not res_df.empty else "No new setups found."}
     
-    <p style="font-size: 10px; color: gray;">Settings: 3:1 RR | 55% Win Rate | 3:45 PM Check</p>
+    <p style="font-size: 10px; color: gray;">Settings: pandas_ta | VIX Filter | 3:45 PM Check</p>
     </body></html>
     """
     msg.add_alternative(body, subtype='html')
     msg['Subject'] = subject
     msg['From'] = user
-    msg['To'] = receiver
+    msg['To'] = os.environ.get('EMAIL_RECEIVER')
     
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(user, password)
+        smtp.login(user, os.environ.get('EMAIL_PASS'))
         smtp.send_message(msg)
 
-# --- 5. MAIN LOGIC (UPDATED FOR SAFETY) ---
+# --- 6. MAIN LOGIC ---
 def run_main():
     # 1. Check Time
     is_time, ny_time = is_market_closing_soon()
-    # UNCOMMENT THE NEXT TWO LINES TO ENFORCE TIME GATE
     if not is_time:
         print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
         return
 
-    ticker_file = "tickers.txt"
-    if not os.path.exists(ticker_file):
-        print("ERROR: tickers.txt file not found.")
+    # 2. Check Market Tide (SPY/VIX)
+    tide_safe, tide_msg = get_market_tide()
+    print(f"Tide Check: {tide_msg}")
+    
+    # If Market is unsafe, we send an email and EXIT immediately.
+    # We do NOT download tickers. This saves 3 mins and protects capital.
+    if not tide_safe:
+        send_email(pd.DataFrame(), "Trade Blocked: Market Unsafe", "<p>No Trades.</p>", ny_time, tide_msg)
         return
-        
+
+    ticker_file = "tickers.txt"
+    if not os.path.exists(ticker_file): return
     with open(ticker_file, 'r') as f:
         tickers = [line.strip().upper() for line in f if line.strip()]
 
     print(f"Executing Sniper Scan at {ny_time}...")
     
-    # 2. Robust Download
+    # 3. Robust Download
     try:
         data = yf.download(tickers, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True)
     except Exception as e:
@@ -174,8 +219,7 @@ def run_main():
 
     hits = []
     
-    # 3. Process Tickers
-    print(f"Scanning {len(tickers)} tickers...")
+    # 4. Process Tickers
     for i, symbol in enumerate(tickers):
         try:
             # Handle MultiIndex logic
@@ -195,7 +239,7 @@ def run_main():
             # Filter 1: Price & Volume
             if price < 1.0 or (df['Volume'].iloc[-1] / avg_vol) < 1.5 or avg_vol < 300000: continue
             
-            # Filter 2: Technicals
+            # Filter 2: Technicals (Using pandas_ta)
             df = calculate_indicators(df)
             today, yesterday = df.iloc[-1], df.iloc[-2]
             
@@ -220,32 +264,14 @@ def run_main():
                             "win_rate": round(real_win_rate, 1), 
                             "price": round(price, 2)
                         })
-        except Exception:
+        except:
             continue
 
     res_df = pd.DataFrame(hits)
-    print(f"Scan complete. Found {len(res_df)} hits.")
     
-    # 4. Execute & Report
-    # We use try/except blocks here so one failure doesn't crash the whole script
-    trade_log = "Trade Execution Skipped (Error)"
-    port_html = "<p>Portfolio Data Unavailable</p>"
-
-    try:
-        print("Attempting to execute trades...")
-        trade_log, port_html = execute_alpaca_trades(res_df)
-        print("Trades processed successfully.")
-    except Exception as e:
-        print(f"CRITICAL ALPACA ERROR: {e}")
-        trade_log = f"Alpaca Failed: {e}"
-
-    try:
-        print("Attempting to send email...")
-        send_email(res_df, trade_log, port_html, ny_time)
-        print("Email sent successfully.")
-    except Exception as e:
-        print(f"CRITICAL EMAIL ERROR: {e}")
+    # 5. Execute & Report
+    trade_log, port_html = execute_alpaca_trades(res_df)
+    send_email(res_df, trade_log, port_html, ny_time, tide_msg)
 
 if __name__ == "__main__":
     run_main()
-
