@@ -1,10 +1,11 @@
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta  # PRO UPGRADE
+import pandas_ta as ta
 import numpy as np
 import os
 import time
 import smtplib
+import requests
 from datetime import datetime
 import pytz
 from email.message import EmailMessage
@@ -12,13 +13,22 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
+# --- 0. ANTI-BLOCK SESSION ---
+def get_yfinance_session():
+    """Creates a session that looks like a real Chrome browser to bypass blocks."""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    return session
+
 # --- 1. THE BOUNCER (Time Gate) ---
 def is_market_closing_soon():
     """Checks if current NY time is strictly between 3:40 PM and 3:59 PM."""
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
     
-    # Check for the 3:40 PM - 3:59 PM window
+    # 3:40 PM - 3:59 PM window
     if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
         return True, now_ny.strftime("%I:%M %p %Z")
         
@@ -26,86 +36,83 @@ def is_market_closing_soon():
 
 # --- 2. MARKET TIDE (SPY + VIX) ---
 def get_market_tide():
-    """Returns True only if Market is Healthy (SPY Uptrend + VIX Calm)."""
-    try:
-        # Download SPY and VIX
-        tickers = ["SPY", "^VIX"]
-        data = yf.download(tickers, period="50d", group_by='ticker', progress=False, auto_adjust=True)
-        
-        # 1. SPY Check (Must be above SMA 20)
-        spy_df = data["SPY"]
-        spy_close = spy_df['Close'].iloc[-1]
-        spy_sma20 = spy_df['Close'].rolling(20).mean().iloc[-1]
-        spy_ok = spy_close > spy_sma20
-        
-        # 2. VIX Check (Must be below 32 - Panic Threshold)
-        vix_df = data["^VIX"]
-        vix_close = vix_df['Close'].iloc[-1]
-        vix_ok = vix_close < 32
-        
-        status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
-        
-        if spy_ok and vix_ok:
-            return True, f"✅ MARKET HEALTHY. {status_msg}"
-        else:
-            return False, f"⛔ MARKET UNSAFE. {status_msg}"
+    session = get_yfinance_session()
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            # Download SPY and VIX with browser session
+            data = yf.download(["SPY", "^VIX"], period="50d", group_by='ticker', progress=False, auto_adjust=True, session=session)
             
-    except Exception as e:
-        return True, f"⚠️ Tide Check Failed ({e}). Assuming Safe."
+            if data.empty: raise ValueError("Empty Data")
 
-# --- 3. PRO INDICATORS (pandas_ta) ---
+            # 1. SPY Check (Must be above SMA 20)
+            spy_df = data["SPY"]
+            spy_close = spy_df['Close'].iloc[-1]
+            spy_sma20 = spy_df['Close'].rolling(20).mean().iloc[-1]
+            spy_ok = spy_close > spy_sma20
+            
+            # 2. VIX Check (Must be below 32)
+            vix_df = data["^VIX"]
+            vix_close = vix_df['Close'].iloc[-1]
+            vix_ok = vix_close < 32
+            
+            status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
+            
+            if spy_ok and vix_ok:
+                return True, f"✅ MARKET HEALTHY. {status_msg}"
+            else:
+                return False, f"⛔ MARKET UNSAFE. {status_msg}"
+                
+        except Exception as e:
+            print(f"Tide Check Retry {attempt+1}/{max_retries}: {e}")
+            time.sleep(5)
+            
+    return True, "⚠️ Tide Check Failed (Rate Limited). Assuming Safe."
+
+# --- 3. PRO INDICATORS ---
 def calculate_indicators(df):
-    """Uses Professional pandas_ta library for accurate Wilder's Smoothing."""
-    # Ensure no NaN values interfere with calculation
     df = df.copy()
-    
-    # ADX (Standard 14 period) -> Adds columns ADX_14, DMP_14, DMN_14
-    df.ta.adx(length=14, append=True)
-    
-    # SMAs
-    df.ta.sma(length=10, append=True)
-    df.ta.sma(length=20, append=True)
-    
-    # Rename for logic compatibility
-    # If pandas_ta fails to generate columns (rare), we fill with 0
-    if 'ADX_14' in df.columns:
-        df['ADX'] = df['ADX_14']
-    else:
-        df['ADX'] = 0
+    # Use pandas_ta for robust calculations
+    try:
+        df.ta.adx(length=14, append=True)
+        df.ta.sma(length=10, append=True)
+        df.ta.sma(length=20, append=True)
         
-    if 'SMA_10' in df.columns:
-        df['SMA10'] = df['SMA_10']
-    else:
-        df['SMA10'] = 0
-        
-    if 'SMA_20' in df.columns:
-        df['SMA20'] = df['SMA_20']
-    else:
-        df['SMA20'] = 0
+        # Normalize column names if needed
+        if 'ADX_14' in df.columns: df['ADX'] = df['ADX_14']
+        else: df['ADX'] = 0
+            
+        if 'SMA_10' in df.columns: df['SMA10'] = df['SMA_10']
+        else: df['SMA10'] = 0
+            
+        if 'SMA_20' in df.columns: df['SMA20'] = df['SMA_20']
+        else: df['SMA20'] = 0
+    except:
+        return df # Return original if TA fails
         
     return df
 
 # --- 4. EXECUTION ENGINE ---
 def execute_alpaca_trades(winning_df):
+    # CRASH FIX: If dataframe is empty, exit immediately
+    if winning_df.empty:
+        return "No trades to execute (Empty Data).", "<p>No open positions.</p>"
+
     api_key = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     
-    # Keep paper=True until confident
     client = TradingClient(api_key, secret_key, paper=True) 
-    
-    # Maintenance: Clear yesterday's leftover orders
     client.cancel_orders()
     time.sleep(1)
 
     account = client.get_account()
     equity = float(account.equity)
     
-    # PDT Safeguard ($30k threshold)
     if equity < 30000:
         if int(account.daytrade_count) >= 2:
             return f"BLOCKED: PDT Safeguard Active. Trades used: {account.daytrade_count}/3", ""
 
-    # Portfolio Check
     positions = client.get_all_positions()
     existing_tickers = [p.symbol for p in positions]
     
@@ -117,9 +124,13 @@ def execute_alpaca_trades(winning_df):
         })
     portfolio_html = pd.DataFrame(portfolio_list).to_html(index=False) if portfolio_list else "<p>No open positions.</p>"
 
-    # Sizing Logic
     MAX_SETUPS = 20
     MAX_CASH = 5000.00
+    
+    # Filter out existing (Crash fix: ensure 'ticker' column exists)
+    if 'ticker' not in winning_df.columns:
+        return "Error: DataFrame missing ticker column.", portfolio_html
+
     fresh_setups = winning_df[~winning_df['ticker'].isin(existing_tickers)]
     num_setups = min(len(fresh_setups), MAX_SETUPS)
     
@@ -151,9 +162,13 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
     msg = EmailMessage()
     user = os.environ.get('EMAIL_USER')
     
-    subject = f"Sniper Report: {len(res_df)} Hits" if not res_df.empty else "Sniper Report: No Trades"
+    hits_count = len(res_df) if not res_df.empty else 0
+    subject = f"Sniper Report: {hits_count} Hits"
     if "MARKET UNSAFE" in tide_msg: subject = "⛔ Sniper Report: MARKET UNSAFE"
     
+    # Handle empty dataframe for HTML conversion
+    hits_html = res_df.to_html(index=False) if not res_df.empty else "No new setups found."
+
     body = f"""
     <html><body style="font-family: Arial, sans-serif;">
     <h2 style="color: #2E86C1;">Sniper Command Center - {ny_time}</h2>
@@ -171,9 +186,9 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
     {port_html}
     
     <h3>Scanner Hits (New Only)</h3>
-    {res_df.to_html(index=False) if not res_df.empty else "No new setups found."}
+    {hits_html}
     
-    <p style="font-size: 10px; color: gray;">Settings: pandas_ta | VIX Filter | 3:45 PM Check</p>
+    <p style="font-size: 10px; color: gray;">Settings: Anti-Block Session | VIX Filter | 3:45 PM Check</p>
     </body></html>
     """
     msg.add_alternative(body, subtype='html')
@@ -187,18 +202,15 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
 
 # --- 6. MAIN LOGIC ---
 def run_main():
-    # 1. Check Time
     is_time, ny_time = is_market_closing_soon()
     if not is_time:
         print(f"Skipping: Time is {ny_time}. Not in closing window (3:40-3:59 PM).")
         return
 
-    # 2. Check Market Tide (SPY/VIX)
+    # 1. TIDE CHECK (With Retry)
     tide_safe, tide_msg = get_market_tide()
     print(f"Tide Check: {tide_msg}")
     
-    # If Market is unsafe, we send an email and EXIT immediately.
-    # We do NOT download tickers. This saves 3 mins and protects capital.
     if not tide_safe:
         send_email(pd.DataFrame(), "Trade Blocked: Market Unsafe", "<p>No Trades.</p>", ny_time, tide_msg)
         return
@@ -210,66 +222,66 @@ def run_main():
 
     print(f"Executing Sniper Scan at {ny_time}...")
     
-    # 3. Robust Download
-    try:
-        data = yf.download(tickers, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True)
-    except Exception as e:
-        print(f"CRITICAL DOWNLOAD ERROR: {e}")
-        return
-
+    # 2. DOWNLOAD (With Retry & User-Agent)
+    session = get_yfinance_session()
+    data = pd.DataFrame()
+    
+    # Retry loop for main download
+    for attempt in range(3):
+        try:
+            print(f"Download Attempt {attempt+1}...")
+            data = yf.download(tickers, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True, session=session)
+            if not data.empty: break
+        except Exception as e:
+            print(f"Rate Limit/Error: {e}. Waiting 20s...")
+            time.sleep(20)
+    
     hits = []
     
-    # 4. Process Tickers
-    for i, symbol in enumerate(tickers):
-        try:
-            # Handle MultiIndex logic
-            if len(tickers) > 1:
-                df = data[symbol]
-            else:
-                df = data
+    # 3. PROCESS DATA
+    if not data.empty:
+        for i, symbol in enumerate(tickers):
+            try:
+                if len(tickers) > 1: df = data[symbol]
+                else: df = data
 
-            if df.empty or df['Close'].isna().all(): continue
-            
-            df = df.dropna()
-            if len(df) < 50: continue
-            
-            price = df['Close'].iloc[-1]
-            avg_vol = df['Volume'].iloc[-21:-1].mean()
-            
-            # Filter 1: Price & Volume
-            if price < 1.0 or (df['Volume'].iloc[-1] / avg_vol) < 1.5 or avg_vol < 300000: continue
-            
-            # Filter 2: Technicals (Using pandas_ta)
-            df = calculate_indicators(df)
-            today, yesterday = df.iloc[-1], df.iloc[-2]
-            
-            if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
+                if df.empty or df['Close'].isna().all(): continue
                 
-                # Filter 3: REAL BACKTEST
-                hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
-                wins, total = 0, 0
+                df = df.dropna()
+                if len(df) < 50: continue
                 
-                for d in hist:
-                    idx = df.index.get_loc(d)
-                    if idx + 3 < len(df):
-                        if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: 
-                            wins += 1
-                        total += 1
+                price = df['Close'].iloc[-1]
+                avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                if total > 0:
-                    real_win_rate = (wins / total) * 100
-                    if real_win_rate >= 55:
-                        hits.append({
-                            "ticker": symbol, 
-                            "win_rate": round(real_win_rate, 1), 
-                            "price": round(price, 2)
-                        })
-        except:
-            continue
+                if price < 1.0 or (df['Volume'].iloc[-1] / avg_vol) < 1.5 or avg_vol < 300000: continue
+                
+                df = calculate_indicators(df)
+                today, yesterday = df.iloc[-1], df.iloc[-2]
+                
+                if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
+                    hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
+                    wins, total = 0, 0
+                    for d in hist:
+                        idx = df.index.get_loc(d)
+                        if idx + 3 < len(df):
+                            if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: wins += 1
+                            total += 1
+                    
+                    if total > 0:
+                        real_win_rate = (wins / total) * 100
+                        if real_win_rate >= 55:
+                            hits.append({
+                                "ticker": symbol, 
+                                "win_rate": round(real_win_rate, 1), 
+                                "price": round(price, 2)
+                            })
+            except: continue
+    else:
+        print("CRITICAL: Failed to download data after retries.")
 
     res_df = pd.DataFrame(hits)
     
-    # 5. Execute & Report
+    # 4. EXECUTE & REPORT
     trade_log, port_html = execute_alpaca_trades(res_df)
     send_email(res_df, trade_log, port_html, ny_time, tide_msg)
 
