@@ -14,9 +14,9 @@ from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopL
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 100       # Download 100 stocks at a time to prevent data loss
-MIN_WIN_RATE = 50.0    # Keep at 50% to see more hits, raise to 55% for strictness
-RISK_REWARD = 3.0      # 3:1 Ratio (Target 3%, Stop 1%)
+BATCH_SIZE = 100       # Download 100 stocks at a time
+MIN_WIN_RATE = 50.0    # Minimum backtested win rate to accept
+RISK_REWARD = 3.0      # 3:1 Ratio
 
 # --- 0. ANTI-BLOCK SESSION ---
 def get_yfinance_session():
@@ -26,22 +26,27 @@ def get_yfinance_session():
     })
     return session
 
-# --- 1. THE BOUNCER ---
+# --- 1. THE BOUNCER (PRODUCTION MODE) ---
 def is_market_closing_soon():
-    # REVERT THIS TO TRUE LOGIC AFTER TESTING
-    return True, "DEBUG MODE" 
-
-    # REAL LOGIC (Uncomment for production):
-    # tz_ny = pytz.timezone('America/New_York')
-    # now_ny = datetime.now(tz_ny)
-    # if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
-    #     return True, now_ny.strftime("%I:%M %p %Z")
-    # return False, now_ny.strftime("%I:%M %p %Z")
+    """
+    Returns True ONLY if NY Time is 3:40 PM - 3:59 PM.
+    Prevents accidental trading at night or morning.
+    """
+    tz_ny = pytz.timezone('America/New_York')
+    now_ny = datetime.now(tz_ny)
+    
+    # PRODUCTION CHECK
+    if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
+        return True, now_ny.strftime("%I:%M %p %Z")
+    
+    # If not time, return False and the reason
+    return False, now_ny.strftime("%I:%M %p %Z")
 
 # --- 2. MARKET TIDE ---
 def get_market_tide():
     session = get_yfinance_session()
     try:
+        # Download SPY and VIX
         data = yf.download(["SPY", "^VIX"], period="50d", group_by='ticker', progress=False, auto_adjust=True, session=session)
         if data.empty: return True, "⚠️ Tide Check Failed (Empty). Assuming Safe."
         
@@ -86,6 +91,10 @@ def execute_alpaca_trades(winning_df):
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client = TradingClient(api_key, secret_key, paper=True) 
     
+    # Cancel old orders first
+    client.cancel_orders()
+    time.sleep(1)
+
     # Portfolio Check
     positions = client.get_all_positions()
     existing = [p.symbol for p in positions]
@@ -102,10 +111,13 @@ def execute_alpaca_trades(winning_df):
     account = client.get_account()
     equity = float(account.equity)
     
-    # Cap size at $5k or split evenly
-    slot_size = min((equity / len(fresh)), 5000.00)
+    # PDT Check
+    if equity < 30000 and int(account.daytrade_count) >= 2:
+        return f"BLOCKED: PDT Safeguard Active ({account.daytrade_count}/3).", port_html
     
+    slot_size = min((equity / len(fresh)), 5000.00)
     log = []
+
     for _, stock in fresh.head(20).iterrows():
         try:
             qty = int(slot_size / stock['price'])
@@ -124,13 +136,21 @@ def execute_alpaca_trades(winning_df):
 
 # --- 5. MAIN LOGIC ---
 def run_main():
+    # 1. TIME CHECK
     is_time, time_msg = is_market_closing_soon()
     if not is_time:
-        print(f"Skipping: {time_msg}")
+        # Logs "Skipping: 09:00 PM EST..." to GitHub console
+        print(f"Skipping: Time is {time_msg}. Not in closing window (3:40-3:59 PM).")
         return
 
+    # 2. TIDE CHECK
     tide_safe, tide_msg = get_market_tide()
     print(f"Tide: {tide_msg}")
+    
+    if not tide_safe:
+        # If unsafe, sends email WARNING and exits (saves time)
+        send_email(pd.DataFrame(), "Trade Blocked: Market Unsafe", "<p>No Trades.</p>", time_msg, tide_msg)
+        return
 
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file): return
@@ -147,13 +167,11 @@ def run_main():
         print(f"Processing Batch {i} to {i+len(batch)}...")
         
         try:
-            # Download Batch
             data = yf.download(batch, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True, session=session)
             
-            # Process Batch
             for symbol in batch:
                 try:
-                    # Handle Data Structure
+                    # Robust Data Access
                     if len(batch) > 1:
                         if symbol not in data.columns.levels[0]: continue
                         df = data[symbol]
@@ -168,20 +186,15 @@ def run_main():
                     price = df['Close'].iloc[-1]
                     avg_vol = df['Volume'].iloc[-21:-1].mean()
                     
-                    # 1. Price/Vol Filter
                     if price < 1.0 or avg_vol < 300000: continue
-                    if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue # Relative Vol 1.2
+                    if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue 
                     
-                    # 2. Technicals
                     df = calculate_indicators(df)
                     today = df.iloc[-1]
                     yesterday = df.iloc[-2]
                     
-                    # Trend: Close > SMA10 > SMA20
-                    # Momentum: ADX Rising
+                    # Strategy: Uptrend + Momentum + Backtest
                     if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
-                        
-                        # 3. Backtest
                         hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
                         wins, total = 0, 0
                         for d in hist:
@@ -199,39 +212,37 @@ def run_main():
                                     "price": round(price, 2)
                                 })
                 except: continue
-                
-            # Sleep to prevent Yahoo blocking
-            time.sleep(0.5)
-            
+            time.sleep(0.5) # Throttle
         except Exception as e:
             print(f"Batch {i} Error: {e}")
             continue
 
     res_df = pd.DataFrame(all_hits)
-    
-    # Sort by Win Rate
     if not res_df.empty:
         res_df = res_df.sort_values(by="win_rate", ascending=False)
 
-    # Execute & Report
     trade_log, port_html = execute_alpaca_trades(res_df)
-    
-    # Send Email
+    send_email(res_df, trade_log, port_html, time_msg, tide_msg)
+
+# --- EMAIL HELPER ---
+def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
     msg = EmailMessage()
-    msg['Subject'] = f"Sniper Report: {len(res_df)} Hits Found"
+    hits = len(res_df) if not res_df.empty else 0
+    msg['Subject'] = f"Sniper Report: {hits} Hits Found"
     msg['From'] = os.environ.get('EMAIL_USER')
     msg['To'] = os.environ.get('EMAIL_RECEIVER')
     
+    hits_html = res_df.head(20).to_html(index=False) if not res_df.empty else "No hits found."
+
     body = f"""
-    <h3>Sniper Run Complete</h3>
-    <p><b>Scanned:</b> {len(all_tickers)} Tickers (Batched)</p>
+    <h3>Sniper Run Complete ({ny_time})</h3>
     <p><b>Market Tide:</b> {tide_msg}</p>
     <hr>
     <h4>Execution Log</h4>
     <pre>{trade_log}</pre>
     <hr>
     <h4>Scanner Results (Top 20)</h4>
-    {res_df.head(20).to_html(index=False) if not res_df.empty else "No hits found."}
+    {hits_html}
     <hr>
     <h4>Current Portfolio</h4>
     {port_html}
