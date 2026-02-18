@@ -2,7 +2,7 @@ name: Daily Market Close Sniper
 
 on:
   schedule:
-    # Shotgun Schedule: Runs every 15 mins to hit the 3:45 PM window reliably
+    # Running every 15 mins to hit the window
     - cron: '*/15 18-21 * * 1-5'
   workflow_dispatch:
 
@@ -16,13 +16,12 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          # UPDATED: Changed from 3.9 to 3.12 to support pandas_ta
           python-version: '3.12'
 
       - name: Install Dependencies
-        # UPDATED: Using pandas-ta (hyphen) and pinned yfinance
-        run: pip install yfinance==0.2.54 pandas lxml requests pytz alpaca-py pandas-ta
-        
+        # CHANGED: Removed "==0.2.54" to force the latest 2026 version
+        run: pip install --upgrade yfinance pandas lxml requests pytz alpaca-py pandas-ta
+
       - name: Run Scan and Trade
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
