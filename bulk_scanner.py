@@ -14,20 +14,19 @@ from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopL
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 50        # Reduced batch size to stay under radar
+BATCH_SIZE = 50        # Small batches to avoid blocks
 MIN_WIN_RATE = 50.0    # 50% Win Rate Filter
 RISK_REWARD = 3.0      # 3:1 Ratio
 
 # --- 0. ANTI-BLOCK SESSION ---
 def get_yfinance_session():
     session = requests.Session()
-    # Updated User-Agent to look more recent
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     })
     return session
 
-# --- 1. THE BOUNCER ---
+# --- 1. THE BOUNCER (TIME GATE) ---
 def is_market_closing_soon():
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
@@ -38,18 +37,15 @@ def is_market_closing_soon():
     
     return False, now_ny.strftime("%I:%M %p %Z")
 
-# --- 2. MARKET TIDE (With Retry) ---
+# --- 2. MARKET TIDE (SENSOR ONLY) ---
 def get_market_tide():
     session = get_yfinance_session()
     
-    # Try twice to get Tide Data
     for attempt in range(2):
         try:
-            # threads=False is key here
             data = yf.download(["SPY", "^VIX"], period="50d", group_by='ticker', threads=False, progress=False, auto_adjust=True, session=session)
             
             if data.empty:
-                print(f"Tide Attempt {attempt+1} Empty. Waiting...")
                 time.sleep(5)
                 continue
             
@@ -59,31 +55,28 @@ def get_market_tide():
             
             status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
             
+            # LOGIC: SPY > SMA20 AND VIX < 32
             if (spy_close > spy_sma20) and (vix_close < 32):
                 return True, f"✅ MARKET HEALTHY. {status_msg}"
-            return False, f"⛔ MARKET UNSAFE. {status_msg}"
+            return False, f"⛔ MARKET DOWN/VOLATILE. {status_msg}"
                 
         except Exception as e:
-            print(f"Tide Error: {e}")
             time.sleep(2)
             
-    return True, "⚠️ Tide Check Failed (Data Blocked). Assuming Safe."
+    return True, "⚠️ Tide Check Failed. Assuming Neutral."
 
 # --- 3. PRO INDICATORS ---
 def calculate_indicators(df):
     df = df.copy()
     try:
-        # Explicit error handling for pandas_ta
         df.ta.adx(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=20, append=True)
         
-        # Mapping columns safely
         df['ADX'] = df['ADX_14'] if 'ADX_14' in df.columns else 0
         df['SMA10'] = df['SMA_10'] if 'SMA_10' in df.columns else 0
         df['SMA20'] = df['SMA_20'] if 'SMA_20' in df.columns else 0
     except Exception as e:
-        # Print error to logs so we know if TA is failing
         print(f"TA Error: {e}")
         return df
     return df
@@ -142,13 +135,12 @@ def run_main():
         print(f"Skipping: {time_msg}. Not in closing window.")
         return
 
+    # 1. TIDE CHECK (SENSOR ONLY - NO RETURN)
     tide_safe, tide_msg = get_market_tide()
     print(f"Tide: {tide_msg}")
     
-    if not tide_safe:
-        send_email(pd.DataFrame(), "Trade Blocked: Market Unsafe", "<p>No Trades.</p>", time_msg, tide_msg)
-        return
-
+    # We DO NOT stop here anymore. We just note the condition.
+    
     ticker_file = "tickers.txt"
     if not os.path.exists(ticker_file): return
     with open(ticker_file, 'r') as f:
@@ -163,25 +155,22 @@ def run_main():
         batch = all_tickers[i:i+BATCH_SIZE]
         print(f"Processing Batch {i} to {i+len(batch)}...")
         
-        # RETRY LOOP FOR EACH BATCH
         batch_data = pd.DataFrame()
         for attempt in range(2):
             try:
-                # threads=False prevents blocking
+                # threads=False for Stealth
                 batch_data = yf.download(batch, period="250d", group_by='ticker', threads=False, progress=False, auto_adjust=True, session=session)
                 if not batch_data.empty:
                     break
-                print(f"Batch {i} Empty on attempt {attempt+1}...")
                 time.sleep(3)
             except Exception as e:
-                print(f"Batch {i} Download Error: {e}")
+                print(f"Batch {i} Error: {e}")
                 time.sleep(3)
 
         if batch_data.empty:
-            print(f"CRITICAL: Batch {i} FAILED/BLOCKED. Skipping.")
+            print(f"Batch {i} FAILED/BLOCKED. Skipping.")
             continue
 
-        # Process the valid data
         for symbol in batch:
             try:
                 if len(batch) > 1:
@@ -204,6 +193,10 @@ def run_main():
                 today = df.iloc[-1]
                 yesterday = df.iloc[-2]
                 
+                # --- MARKET NEUTRAL LOGIC ---
+                # This filter works for Regular stocks in Bull Markets
+                # AND Inverse stocks in Bear Markets.
+                # It just asks: "Is this specific chart going up?"
                 if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
                     hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
                     wins, total = 0, 0
@@ -223,7 +216,6 @@ def run_main():
                             })
             except: continue
         
-        # Increase sleep to 2 seconds to act "Human"
         time.sleep(2)
 
     res_df = pd.DataFrame(all_hits)
@@ -231,21 +223,31 @@ def run_main():
         res_df = res_df.sort_values(by="win_rate", ascending=False)
 
     trade_log, port_html = execute_alpaca_trades(res_df)
-    send_email(res_df, trade_log, port_html, time_msg, tide_msg)
+    send_email(res_df, trade_log, port_html, time_msg, tide_msg, tide_safe)
 
 # --- EMAIL HELPER ---
-def send_email(res_df, trade_log, port_html, ny_time, tide_msg):
+def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe):
     msg = EmailMessage()
     hits = len(res_df) if not res_df.empty else 0
-    msg['Subject'] = f"Sniper Report: {hits} Hits Found"
+    
+    # DYNAMIC SUBJECT LINE
+    # If Tide is Safe -> "Sniper Report"
+    # If Tide is Unsafe (Bear Market) -> "Bear Scan Report"
+    if tide_safe:
+        subject = f"Sniper Report: {hits} Hits Found"
+    else:
+        subject = f"📉 Bear Scan Report: {hits} Hits (Market Down)"
+
+    msg['Subject'] = subject
     msg['From'] = os.environ.get('EMAIL_USER')
     msg['To'] = os.environ.get('EMAIL_RECEIVER')
     
     hits_html = res_df.head(20).to_html(index=False) if not res_df.empty else "No hits found."
 
     body = f"""
-    <h3>Sniper Run Complete ({ny_time})</h3>
+    <h3>Run Complete ({ny_time})</h3>
     <p><b>Market Tide:</b> {tide_msg}</p>
+    <p><i>Note: If market is unsafe, results may be inverse ETFs.</i></p>
     <hr>
     <h4>Execution Log</h4>
     <pre>{trade_log}</pre>
