@@ -14,72 +14,77 @@ from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopL
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 100       # Download 100 stocks at a time
-MIN_WIN_RATE = 50.0    # Minimum backtested win rate to accept
+BATCH_SIZE = 50        # Reduced batch size to stay under radar
+MIN_WIN_RATE = 50.0    # 50% Win Rate Filter
 RISK_REWARD = 3.0      # 3:1 Ratio
 
 # --- 0. ANTI-BLOCK SESSION ---
 def get_yfinance_session():
     session = requests.Session()
+    # Updated User-Agent to look more recent
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     })
     return session
 
-# --- 1. THE BOUNCER (PRODUCTION MODE) ---
+# --- 1. THE BOUNCER ---
 def is_market_closing_soon():
-    """
-    Returns True ONLY if NY Time is 3:40 PM - 3:59 PM.
-    Prevents accidental trading at night or morning.
-    """
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
     
-    # PRODUCTION CHECK
+    # PRODUCTION CHECK (3:40 PM - 3:59 PM ET)
     if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
         return True, now_ny.strftime("%I:%M %p %Z")
     
-    # If not time, return False and the reason
     return False, now_ny.strftime("%I:%M %p %Z")
 
-# --- 2. MARKET TIDE ---
+# --- 2. MARKET TIDE (With Retry) ---
 def get_market_tide():
     session = get_yfinance_session()
-    try:
-        # Download SPY and VIX
-        data = yf.download(["SPY", "^VIX"], period="50d", group_by='ticker', progress=False, auto_adjust=True, session=session)
-        if data.empty: return True, "⚠️ Tide Check Failed (Empty). Assuming Safe."
-        
-        spy_close = data["SPY"]['Close'].iloc[-1]
-        spy_sma20 = data["SPY"]['Close'].rolling(20).mean().iloc[-1]
-        vix_close = data["^VIX"]['Close'].iloc[-1]
-        
-        status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
-        
-        # LOGIC: SPY > SMA20 AND VIX < 32
-        if (spy_close > spy_sma20) and (vix_close < 32):
-            return True, f"✅ MARKET HEALTHY. {status_msg}"
-        return False, f"⛔ MARKET UNSAFE. {status_msg}"
+    
+    # Try twice to get Tide Data
+    for attempt in range(2):
+        try:
+            # threads=False is key here
+            data = yf.download(["SPY", "^VIX"], period="50d", group_by='ticker', threads=False, progress=False, auto_adjust=True, session=session)
             
-    except Exception as e:
-        return True, f"⚠️ Tide Check Error ({e}). Assuming Safe."
+            if data.empty:
+                print(f"Tide Attempt {attempt+1} Empty. Waiting...")
+                time.sleep(5)
+                continue
+            
+            spy_close = data["SPY"]['Close'].iloc[-1]
+            spy_sma20 = data["SPY"]['Close'].rolling(20).mean().iloc[-1]
+            vix_close = data["^VIX"]['Close'].iloc[-1]
+            
+            status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f}) | VIX: {vix_close:.2f}"
+            
+            if (spy_close > spy_sma20) and (vix_close < 32):
+                return True, f"✅ MARKET HEALTHY. {status_msg}"
+            return False, f"⛔ MARKET UNSAFE. {status_msg}"
+                
+        except Exception as e:
+            print(f"Tide Error: {e}")
+            time.sleep(2)
+            
+    return True, "⚠️ Tide Check Failed (Data Blocked). Assuming Safe."
 
 # --- 3. PRO INDICATORS ---
 def calculate_indicators(df):
     df = df.copy()
     try:
+        # Explicit error handling for pandas_ta
         df.ta.adx(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=20, append=True)
         
-        # Normalize columns
-        if 'ADX_14' in df.columns: df['ADX'] = df['ADX_14']
-        else: df['ADX'] = 0
-        if 'SMA_10' in df.columns: df['SMA10'] = df['SMA_10']
-        else: df['SMA10'] = 0
-        if 'SMA_20' in df.columns: df['SMA20'] = df['SMA_20']
-        else: df['SMA20'] = 0
-    except:
+        # Mapping columns safely
+        df['ADX'] = df['ADX_14'] if 'ADX_14' in df.columns else 0
+        df['SMA10'] = df['SMA_10'] if 'SMA_10' in df.columns else 0
+        df['SMA20'] = df['SMA_20'] if 'SMA_20' in df.columns else 0
+    except Exception as e:
+        # Print error to logs so we know if TA is failing
+        print(f"TA Error: {e}")
         return df
     return df
 
@@ -91,11 +96,9 @@ def execute_alpaca_trades(winning_df):
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client = TradingClient(api_key, secret_key, paper=True) 
     
-    # Cancel old orders first
     client.cancel_orders()
     time.sleep(1)
 
-    # Portfolio Check
     positions = client.get_all_positions()
     existing = [p.symbol for p in positions]
     
@@ -107,11 +110,9 @@ def execute_alpaca_trades(winning_df):
     fresh = winning_df[~winning_df['ticker'].isin(existing)]
     if fresh.empty: return "No new setups.", port_html
 
-    # EXECUTION LOOP
     account = client.get_account()
     equity = float(account.equity)
     
-    # PDT Check
     if equity < 30000 and int(account.daytrade_count) >= 2:
         return f"BLOCKED: PDT Safeguard Active ({account.daytrade_count}/3).", port_html
     
@@ -136,19 +137,15 @@ def execute_alpaca_trades(winning_df):
 
 # --- 5. MAIN LOGIC ---
 def run_main():
-    # 1. TIME CHECK
     is_time, time_msg = is_market_closing_soon()
     if not is_time:
-        # Logs "Skipping: 09:00 PM EST..." to GitHub console
-        print(f"Skipping: Time is {time_msg}. Not in closing window (3:40-3:59 PM).")
+        print(f"Skipping: {time_msg}. Not in closing window.")
         return
 
-    # 2. TIDE CHECK
     tide_safe, tide_msg = get_market_tide()
     print(f"Tide: {tide_msg}")
     
     if not tide_safe:
-        # If unsafe, sends email WARNING and exits (saves time)
         send_email(pd.DataFrame(), "Trade Blocked: Market Unsafe", "<p>No Trades.</p>", time_msg, tide_msg)
         return
 
@@ -166,56 +163,68 @@ def run_main():
         batch = all_tickers[i:i+BATCH_SIZE]
         print(f"Processing Batch {i} to {i+len(batch)}...")
         
-        try:
-            data = yf.download(batch, period="250d", group_by='ticker', threads=True, progress=False, auto_adjust=True, session=session)
-            
-            for symbol in batch:
-                try:
-                    # Robust Data Access
-                    if len(batch) > 1:
-                        if symbol not in data.columns.levels[0]: continue
-                        df = data[symbol]
-                    else:
-                        df = data
-                    
-                    if df.empty or df['Close'].isna().all(): continue
-                    
-                    df = df.dropna()
-                    if len(df) < 50: continue
-                    
-                    price = df['Close'].iloc[-1]
-                    avg_vol = df['Volume'].iloc[-21:-1].mean()
-                    
-                    if price < 1.0 or avg_vol < 300000: continue
-                    if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue 
-                    
-                    df = calculate_indicators(df)
-                    today = df.iloc[-1]
-                    yesterday = df.iloc[-2]
-                    
-                    # Strategy: Uptrend + Momentum + Backtest
-                    if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
-                        hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
-                        wins, total = 0, 0
-                        for d in hist:
-                            idx = df.index.get_loc(d)
-                            if idx + 3 < len(df):
-                                if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: wins += 1
-                                total += 1
-                        
-                        if total > 0:
-                            win_rate = (wins/total)*100
-                            if win_rate >= MIN_WIN_RATE:
-                                all_hits.append({
-                                    "ticker": symbol, 
-                                    "win_rate": round(win_rate, 1), 
-                                    "price": round(price, 2)
-                                })
-                except: continue
-            time.sleep(0.5) # Throttle
-        except Exception as e:
-            print(f"Batch {i} Error: {e}")
+        # RETRY LOOP FOR EACH BATCH
+        batch_data = pd.DataFrame()
+        for attempt in range(2):
+            try:
+                # threads=False prevents blocking
+                batch_data = yf.download(batch, period="250d", group_by='ticker', threads=False, progress=False, auto_adjust=True, session=session)
+                if not batch_data.empty:
+                    break
+                print(f"Batch {i} Empty on attempt {attempt+1}...")
+                time.sleep(3)
+            except Exception as e:
+                print(f"Batch {i} Download Error: {e}")
+                time.sleep(3)
+
+        if batch_data.empty:
+            print(f"CRITICAL: Batch {i} FAILED/BLOCKED. Skipping.")
             continue
+
+        # Process the valid data
+        for symbol in batch:
+            try:
+                if len(batch) > 1:
+                    if symbol not in batch_data.columns.levels[0]: continue
+                    df = batch_data[symbol]
+                else:
+                    df = batch_data
+                
+                if df.empty or df['Close'].isna().all(): continue
+                df = df.dropna()
+                if len(df) < 50: continue
+                
+                price = df['Close'].iloc[-1]
+                avg_vol = df['Volume'].iloc[-21:-1].mean()
+                
+                if price < 1.0 or avg_vol < 300000: continue
+                if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue 
+                
+                df = calculate_indicators(df)
+                today = df.iloc[-1]
+                yesterday = df.iloc[-2]
+                
+                if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
+                    hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
+                    wins, total = 0, 0
+                    for d in hist:
+                        idx = df.index.get_loc(d)
+                        if idx + 3 < len(df):
+                            if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: wins += 1
+                            total += 1
+                    
+                    if total > 0:
+                        win_rate = (wins/total)*100
+                        if win_rate >= MIN_WIN_RATE:
+                            all_hits.append({
+                                "ticker": symbol, 
+                                "win_rate": round(win_rate, 1), 
+                                "price": round(price, 2)
+                            })
+            except: continue
+        
+        # Increase sleep to 2 seconds to act "Human"
+        time.sleep(2)
 
     res_df = pd.DataFrame(all_hits)
     if not res_df.empty:
