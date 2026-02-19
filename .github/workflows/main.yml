@@ -2,8 +2,9 @@ name: Daily Market Close Sniper
 
 on:
   schedule:
-    # Running every 15 mins to hit the window
-    - cron: '*/15 18-21 * * 1-5'
+    # Triggers at 19:30 and 20:30 UTC (2:30 PM / 3:30 PM EST)
+    # The Python script handles the exact waiting and DST logic.
+    - cron: '30 19,20 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -19,8 +20,8 @@ jobs:
           python-version: '3.12'
 
       - name: Install Dependencies
-        # CHANGED: Removed "==0.2.54" to force the latest 2026 version
-        run: pip install --upgrade yfinance pandas lxml requests pytz alpaca-py pandas-ta
+        # 100% Alpaca Data. yfinance is gone.
+        run: pip install pandas lxml requests pytz alpaca-py pandas-ta
 
       - name: Run Scan and Trade
         env:
