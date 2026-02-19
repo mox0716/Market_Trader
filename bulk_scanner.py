@@ -9,7 +9,8 @@ import pytz
 from email.message import EmailMessage
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+# UPDATED: Imported LimitOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -20,7 +21,7 @@ BATCH_SIZE = 100
 MIN_WIN_RATE = 50.0    
 RISK_REWARD = 3.0      
 
-# --- 1. THE BOUNCER (SMART WAITER) ---
+# --- 1. THE BOUNCER ---
 def is_market_closing_soon():
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
@@ -37,13 +38,13 @@ def is_market_closing_soon():
     if now_ny < target_time:
         sleep_seconds = (target_time - now_ny).total_seconds()
         
-        # DST Collision Preventer: If it's more than 50 mins early, this is the wrong cron trigger.
+        # DST Collision Preventer
         if sleep_seconds > 3000:
             return False, "Too early (Wrong DST schedule). Exiting silently."
             
         print(f"⏰ GitHub started early. Sleeping for {sleep_seconds/60:.1f} minutes until exactly 3:45 PM NY Time...")
         time.sleep(sleep_seconds)
-        now_ny = datetime.now(tz_ny) # Update clock after waking up
+        now_ny = datetime.now(tz_ny)
 
     # 3. Exactly on time
     return True, now_ny.strftime("%I:%M %p %Z")
@@ -107,9 +108,6 @@ def execute_alpaca_trades(winning_df):
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client = TradingClient(api_key, secret_key, paper=True) 
     
-    client.cancel_orders()
-    time.sleep(1)
-
     positions = client.get_all_positions()
     existing = [p.symbol for p in positions]
     port_list = [{"Symbol": p.symbol, "P/L": f"${float(p.unrealized_pl):.2f}"} for p in positions]
@@ -133,14 +131,19 @@ def execute_alpaca_trades(winning_df):
         try:
             qty = int(slot_size / stock['price'])
             if qty > 0:
-                req = MarketOrderRequest(
-                    symbol=stock['ticker'], qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+                # UPDATED: Limit Order Request with 4.5% Profit and 1.5% Stop
+                req = LimitOrderRequest(
+                    symbol=stock['ticker'], 
+                    qty=qty, 
+                    limit_price=round(stock['price'], 2), # Exact price from scanner
+                    side=OrderSide.BUY, 
+                    time_in_force=TimeInForce.DAY,        # Expires at 4:00 PM if unfilled
                     order_class=OrderClass.BRACKET,
-                    take_profit=TakeProfitRequest(limit_price=round(stock['price']*1.03, 2)),
-                    stop_loss=StopLossRequest(stop_price=round(stock['price']*0.99, 2))
+                    take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.045, 2)),
+                    stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
                 client.submit_order(req)
-                log.append(f"BOUGHT {qty} {stock['ticker']} @ ${stock['price']}")
+                log.append(f"PLACED LIMIT BUY {qty} {stock['ticker']} @ ${stock['price']}")
         except Exception as e: log.append(f"Err {stock['ticker']}: {e}")
             
     return "\n".join(log), port_html
@@ -194,7 +197,7 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                # Volume/Price Filter (Loosened)
+                # Volume/Price Filter 
                 if price < 1.0 or avg_vol < 100000: continue
                 
                 stats["passed_volume_filter"] += 1
