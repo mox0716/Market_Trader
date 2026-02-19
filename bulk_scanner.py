@@ -20,9 +20,33 @@ BATCH_SIZE = 100
 MIN_WIN_RATE = 50.0    
 RISK_REWARD = 3.0      
 
-# --- 1. THE BOUNCER ---
+# --- 1. THE BOUNCER (SMART WAITER) ---
 def is_market_closing_soon():
-    return True, "DEBUG OVERRIDE"
+    tz_ny = pytz.timezone('America/New_York')
+    now_ny = datetime.now(tz_ny)
+    
+    # Target execution time: Exactly 3:45:00 PM NY Time
+    target_time = now_ny.replace(hour=15, minute=45, second=0, microsecond=0)
+    cutoff_time = now_ny.replace(hour=15, minute=59, second=59, microsecond=0)
+
+    # 1. Too late? (After 4:00 PM)
+    if now_ny > cutoff_time:
+        return False, f"Too late. Market closed. ({now_ny.strftime('%I:%M %p')})"
+
+    # 2. Too early? (Before 3:45 PM)
+    if now_ny < target_time:
+        sleep_seconds = (target_time - now_ny).total_seconds()
+        
+        # DST Collision Preventer: If it's more than 50 mins early, this is the wrong cron trigger.
+        if sleep_seconds > 3000:
+            return False, "Too early (Wrong DST schedule). Exiting silently."
+            
+        print(f"⏰ GitHub started early. Sleeping for {sleep_seconds/60:.1f} minutes until exactly 3:45 PM NY Time...")
+        time.sleep(sleep_seconds)
+        now_ny = datetime.now(tz_ny) # Update clock after waking up
+
+    # 3. Exactly on time
+    return True, now_ny.strftime("%I:%M %p %Z")
 
 # --- 2. ALPACA DATA ENGINE ---
 def get_alpaca_data(symbols, days_back=365):
@@ -116,7 +140,7 @@ def execute_alpaca_trades(winning_df):
                     stop_loss=StopLossRequest(stop_price=round(stock['price']*0.99, 2))
                 )
                 client.submit_order(req)
-                log.append(f"BOUGHT {qty} {stock['ticker']} @ {stock['price']}")
+                log.append(f"BOUGHT {qty} {stock['ticker']} @ ${stock['price']}")
         except Exception as e: log.append(f"Err {stock['ticker']}: {e}")
             
     return "\n".join(log), port_html
@@ -124,7 +148,9 @@ def execute_alpaca_trades(winning_df):
 # --- 6. MAIN LOGIC ---
 def run_main():
     is_time, time_msg = is_market_closing_soon()
-    if not is_time: return
+    if not is_time:
+        print(f"Skipping: {time_msg}")
+        return
 
     tide_safe, tide_msg = get_market_tide()
     
@@ -136,7 +162,6 @@ def run_main():
     all_hits = []
     error_log = []
     
-    # COUNTERS FOR PROOF
     stats = {
         "total_scanned": len(all_tickers),
         "valid_downloads": 0,
@@ -169,9 +194,8 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                # Volume/Price Filter
-                if price < 1.0 or avg_vol < 300000: continue
-                if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue 
+                # Volume/Price Filter (Loosened)
+                if price < 1.0 or avg_vol < 100000: continue
                 
                 stats["passed_volume_filter"] += 1
                 
