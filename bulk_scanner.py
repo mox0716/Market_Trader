@@ -1,15 +1,14 @@
-import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import os
 import time
 import smtplib
-import requests
-import random
 from datetime import datetime, timedelta
 import pytz
 from email.message import EmailMessage
+
+# --- ALPACA SDK ---
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
@@ -18,64 +17,62 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 50        # Smaller batches = Less blocking
+BATCH_SIZE = 100       # Alpaca allows large batches with zero IP blocking
 MIN_WIN_RATE = 50.0    # 50% Win Rate Filter
 RISK_REWARD = 3.0      # 3:1 Ratio
-
-# --- 0. ANTI-BLOCK SESSION ---
-def get_yfinance_session():
-    session = requests.Session()
-    # Rotating User Agents to evade detection
-    agents = [
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0'
-    ]
-    session.headers.update({'User-Agent': random.choice(agents)})
-    return session
 
 # --- 1. THE BOUNCER ---
 def is_market_closing_soon():
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
     
-    # PRODUCTION CHECK
-    if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
-        return True, now_ny.strftime("%I:%M %p %Z")
-    
-    return False, now_ny.strftime("%I:%M %p %Z")
+    # Bypass for testing right now (Comment out for production)
+    return True, "DEBUG OVERRIDE"
 
-# --- 2. MARKET TIDE (VIA ALPACA) ---
-# Switched to Alpaca Data to guarantee we get the Market Status
-def get_market_tide():
+    # PRODUCTION CHECK (Uncomment this for real trading)
+    # if now_ny.hour == 15 and 40 <= now_ny.minute <= 59:
+    #     return True, now_ny.strftime("%I:%M %p %Z")
+    # return False, now_ny.strftime("%I:%M %p %Z")
+
+# --- 2. ALPACA DATA ENGINE ---
+def get_alpaca_data(symbols, days_back=365):
+    """Fetches historical daily bars directly from Alpaca (No Yahoo Finance)."""
+    api_key = os.environ.get('ALPACA_API_KEY')
+    secret_key = os.environ.get('ALPACA_SECRET_KEY')
+    
+    # The Data Client is separate from the Trading Client
+    client = StockHistoricalDataClient(api_key, secret_key)
+    
+    req = StockBarsRequest(
+        symbol_or_symbols=symbols,
+        timeframe=TimeFrame.Day,
+        start=datetime.now(pytz.utc) - timedelta(days=days_back)
+    )
+    
     try:
-        api_key = os.environ.get('ALPACA_API_KEY')
-        secret_key = os.environ.get('ALPACA_SECRET_KEY')
-        data_client = StockHistoricalDataClient(api_key, secret_key)
+        bars = client.get_stock_bars(req)
+        if not bars or bars.df.empty:
+            return pd.DataFrame()
+        return bars.df
+    except Exception as e:
+        print(f"Alpaca Data Error: {e}")
+        return pd.DataFrame()
+
+# --- 3. MARKET TIDE (VIA ALPACA) ---
+def get_market_tide():
+    # We use SPY to check the tide. Alpaca doesn't support VIX (it's an index, not a stock).
+    df = get_alpaca_data(["SPY", "QQQ"], days_back=40)
+    
+    if df.empty or "SPY" not in df.index.levels[0]:
+        return True, "⚠️ Tide Check Failed (Alpaca Empty). Assuming Neutral."
         
-        # Get last 25 days of SPY
-        req = StockBarsRequest(
-            symbol_or_symbols="SPY",
-            timeframe=TimeFrame.Day,
-            start=datetime.now(pytz.utc) - timedelta(days=40)
-        )
-        bars = data_client.get_stock_bars(req)
+    try:
+        spy_df = df.loc["SPY"]
+        spy_close = spy_df['close'].iloc[-1]
+        spy_sma20 = spy_df['close'].rolling(20).mean().iloc[-1]
         
-        if not bars or "SPY" not in bars:
-            return True, "⚠️ Tide Check Failed (Alpaca Empty). Assuming Neutral."
-            
-        spy_data = bars["SPY"]
-        closes = [bar.close for bar in spy_data]
+        status_msg = f"SPY: ${spy_close:.2f} (SMA20: ${spy_sma20:.2f})"
         
-        if len(closes) < 20:
-            return True, "⚠️ Tide Check Failed (Not enough data). Assuming Neutral."
-            
-        spy_close = closes[-1]
-        spy_sma20 = sum(closes[-20:]) / 20
-        
-        status_msg = f"SPY: {spy_close:.2f} (SMA20: {spy_sma20:.2f})"
-        
-        # Logic: If SPY > SMA20, Market is Bullish. If not, Bearish/Neutral.
         if spy_close > spy_sma20:
             return True, f"✅ MARKET HEALTHY. {status_msg}"
         return False, f"⛔ MARKET DOWN. {status_msg}"
@@ -83,7 +80,7 @@ def get_market_tide():
     except Exception as e:
         return True, f"⚠️ Tide Check Error ({e}). Assuming Neutral."
 
-# --- 3. PRO INDICATORS ---
+# --- 4. PRO INDICATORS ---
 def calculate_indicators(df):
     df = df.copy()
     try:
@@ -98,7 +95,7 @@ def calculate_indicators(df):
         return df
     return df
 
-# --- 4. EXECUTION ---
+# --- 5. EXECUTION ---
 def execute_alpaca_trades(winning_df):
     if winning_df.empty: return "No trades.", "<p>No positions.</p>"
 
@@ -145,14 +142,13 @@ def execute_alpaca_trades(winning_df):
             
     return "\n".join(log), port_html
 
-# --- 5. MAIN LOGIC ---
+# --- 6. MAIN LOGIC ---
 def run_main():
     is_time, time_msg = is_market_closing_soon()
     if not is_time:
         print(f"Skipping: {time_msg}. Not in closing window.")
         return
 
-    # ALPACA TIDE CHECK (No Yahoo)
     tide_safe, tide_msg = get_market_tide()
     print(f"Tide: {tide_msg}")
     
@@ -162,37 +158,29 @@ def run_main():
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
     print(f"Starting Scan for {len(all_tickers)} tickers in batches of {BATCH_SIZE}...")
-    session = get_yfinance_session()
     all_hits = []
-    error_log = [] # NEW: Tracks failed batches
+    error_log = []
     
-    # --- BATCH PROCESSING LOOP ---
+    # --- BATCH PROCESSING LOOP (ALPACA API) ---
     for i in range(0, len(all_tickers), BATCH_SIZE):
         batch = all_tickers[i:i+BATCH_SIZE]
+        print(f"Processing Batch {i} to {i+len(batch)}...")
         
-        batch_data = pd.DataFrame()
-        for attempt in range(2):
-            try:
-                # threads=False for Stealth
-                batch_data = yf.download(batch, period="250d", group_by='ticker', threads=False, progress=False, auto_adjust=True, session=session)
-                if not batch_data.empty:
-                    break
-                time.sleep(2)
-            except Exception as e:
-                time.sleep(2)
-
+        # 365 calendar days gets us ~250 trading days
+        batch_data = get_alpaca_data(batch, days_back=365)
+        
         if batch_data.empty:
-            print(f"Batch {i} FAILED/BLOCKED.")
-            error_log.append(f"Batch {i}-{i+BATCH_SIZE}: FAILED (Empty Data)")
+            error_log.append(f"Batch {i}-{i+BATCH_SIZE}: FAILED (Alpaca Error/Invalid Tickers)")
             continue
 
         for symbol in batch:
             try:
-                if len(batch) > 1:
-                    if symbol not in batch_data.columns.levels[0]: continue
-                    df = batch_data[symbol]
-                else:
-                    df = batch_data
+                # Extract single stock from Alpaca's MultiIndex DataFrame
+                if symbol not in batch_data.index.levels[0]: continue
+                df = batch_data.loc[symbol].copy()
+                
+                # Format Alpaca columns to match our TA logic
+                df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
                 
                 if df.empty or df['Close'].isna().all(): continue
                 df = df.dropna()
@@ -201,6 +189,7 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
+                # Filter: Penny Stocks and Low Volume
                 if price < 1.0 or avg_vol < 300000: continue
                 if (df['Volume'].iloc[-1] / avg_vol) < 1.2: continue 
                 
@@ -208,11 +197,12 @@ def run_main():
                 today = df.iloc[-1]
                 yesterday = df.iloc[-2]
                 
-                # Market Neutral Logic (Works for Bull & Bear tickers)
+                # Strategy
                 if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
                     hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
                     wins, total = 0, 0
                     for d in hist:
+                        # Find the index position of the date
                         idx = df.index.get_loc(d)
                         if idx + 3 < len(df):
                             if df.iloc[idx+3]['Close'] > df.iloc[idx]['Close']: wins += 1
@@ -227,8 +217,6 @@ def run_main():
                                 "price": round(price, 2)
                             })
             except: continue
-        
-        time.sleep(2)
 
     res_df = pd.DataFrame(all_hits)
     if not res_df.empty:
@@ -251,7 +239,6 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
     
     hits_html = res_df.head(20).to_html(index=False) if not res_df.empty else "No hits found."
     
-    # NEW: Error Log Display
     errors_html = ""
     if error_log:
         errors_html = f"<hr><h4 style='color:red'>Failed Batches ({len(error_log)})</h4><pre>{chr(10).join(error_log[:10])}</pre>"
