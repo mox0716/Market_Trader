@@ -9,7 +9,6 @@ import pytz
 from email.message import EmailMessage
 
 from alpaca.trading.client import TradingClient
-# UPDATED: Imported LimitOrderRequest
 from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
@@ -21,7 +20,7 @@ BATCH_SIZE = 100
 MIN_WIN_RATE = 50.0    
 RISK_REWARD = 3.0      
 
-# --- 1. THE BOUNCER ---
+# --- 1. THE BOUNCER (SMART WAITER) ---
 def is_market_closing_soon():
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
@@ -108,6 +107,13 @@ def execute_alpaca_trades(winning_df):
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client = TradingClient(api_key, secret_key, paper=True) 
     
+    # SURGICAL CANCEL: Only cancel rogue BUY orders, leave active SELL targets alone
+    open_orders = client.get_orders()
+    for order in open_orders:
+        if order.side == OrderSide.BUY:
+            client.cancel_order_by_id(order.id)
+    time.sleep(1)
+
     positions = client.get_all_positions()
     existing = [p.symbol for p in positions]
     port_list = [{"Symbol": p.symbol, "P/L": f"${float(p.unrealized_pl):.2f}"} for p in positions]
@@ -131,19 +137,22 @@ def execute_alpaca_trades(winning_df):
         try:
             qty = int(slot_size / stock['price'])
             if qty > 0:
-                # UPDATED: Limit Order Request with 4.5% Profit and 1.5% Stop
+                # 0.2% buffer guarantees fill while protecting against massive slippage
+                safe_entry_price = round(stock['price'] * 1.002, 2)
+
                 req = LimitOrderRequest(
                     symbol=stock['ticker'], 
                     qty=qty, 
-                    limit_price=round(stock['price'], 2), # Exact price from scanner
+                    limit_price=safe_entry_price,         
                     side=OrderSide.BUY, 
-                    time_in_force=TimeInForce.DAY,        # Expires at 4:00 PM if unfilled
+                    time_in_force=TimeInForce.GTC, 
                     order_class=OrderClass.BRACKET,
+                    # Base targets on the true scanned price, not the buffered price
                     take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.045, 2)),
                     stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
                 client.submit_order(req)
-                log.append(f"PLACED LIMIT BUY {qty} {stock['ticker']} @ ${stock['price']}")
+                log.append(f"PLACED LIMIT BUY {qty} {stock['ticker']} @ up to ${safe_entry_price}")
         except Exception as e: log.append(f"Err {stock['ticker']}: {e}")
             
     return "\n".join(log), port_html
@@ -197,7 +206,7 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                # Volume/Price Filter 
+                # Volume/Price Filter
                 if price < 1.0 or avg_vol < 100000: continue
                 
                 stats["passed_volume_filter"] += 1
