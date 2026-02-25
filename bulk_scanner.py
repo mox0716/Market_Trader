@@ -29,6 +29,9 @@ def is_market_closing_soon():
     target_time = now_ny.replace(hour=15, minute=45, second=0, microsecond=0)
     cutoff_time = now_ny.replace(hour=15, minute=59, second=59, microsecond=0)
 
+    # Bypass for testing (Uncomment to force run outside hours)
+    # return True, "DEBUG OVERRIDE"
+
     # 1. Too late? (After 4:00 PM)
     if now_ny > cutoff_time:
         return False, f"Too late. Market closed. ({now_ny.strftime('%I:%M %p')})"
@@ -122,7 +125,11 @@ def execute_alpaca_trades(winning_df):
     if 'ticker' not in winning_df.columns: return "Error: Missing ticker col", port_html
     
     fresh = winning_df[~winning_df['ticker'].isin(existing)]
-    if fresh.empty: return "No new setups.", port_html
+    
+    # ALLOCATION MATH FIX
+    planned_trades = min(len(fresh), 20)
+    if planned_trades == 0: 
+        return "No new setups.", port_html
 
     account = client.get_account()
     equity = float(account.equity)
@@ -130,7 +137,8 @@ def execute_alpaca_trades(winning_df):
     if equity < 30000 and int(account.daytrade_count) >= 2:
         return f"BLOCKED: PDT Active.", port_html
     
-    slot_size = min((equity / len(fresh)), 5000.00)
+    # Dynamically divides equity among planned trades, strictly capped at $1,000 per stock
+    slot_size = min((equity / planned_trades), 1000.00)
     log = []
 
     for _, stock in fresh.head(20).iterrows():
@@ -147,7 +155,7 @@ def execute_alpaca_trades(winning_df):
                     side=OrderSide.BUY, 
                     time_in_force=TimeInForce.GTC, 
                     order_class=OrderClass.BRACKET,
-                    # Base targets on the true scanned price, not the buffered price
+                    # Base targets on the true scanned price, not the buffered price (4.5% / 1.5%)
                     take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.045, 2)),
                     stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
