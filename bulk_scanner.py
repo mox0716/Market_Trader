@@ -156,7 +156,7 @@ def execute_alpaca_trades(winning_df):
                     time_in_force=TimeInForce.GTC, 
                     order_class=OrderClass.BRACKET,
                     # Base targets on the true scanned price, not the buffered price (4.5% / 1.5%)
-                    take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.045, 2)),
+                    take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.032, 2)),
                     stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
                 client.submit_order(req)
@@ -300,3 +300,4 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
 
 if __name__ == "__main__":
     run_main()
+
