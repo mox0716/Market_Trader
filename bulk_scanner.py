@@ -217,8 +217,8 @@ def run_main():
                 # 1. Strict Liquidity Filter: Minimum 500k average daily volume
                 if price < 1.0 or avg_vol < 500000: continue
                 
-                # 2. Momentum Filter: Today's volume must be at least 1.5x the average
-                if (df['Volume'].iloc[-1] / avg_vol) < 1.5: continue
+                # 2. Momentum Filter: Today's volume must be at least 1.3x the average
+                if (df['Volume'].iloc[-1] / avg_vol) < 1.3: continue
                 
                 stats["passed_volume_filter"] += 1
                 
@@ -303,3 +303,4 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
 
 if __name__ == "__main__":
     run_main()
+
