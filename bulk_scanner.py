@@ -18,7 +18,6 @@ from alpaca.data.timeframe import TimeFrame
 # --- CONFIGURATION ---
 BATCH_SIZE = 100       
 MIN_WIN_RATE = 50.0    
-RISK_REWARD = 3.0      
 
 # --- 1. THE BOUNCER (SMART WAITER) ---
 def is_market_closing_soon():
@@ -126,7 +125,7 @@ def execute_alpaca_trades(winning_df):
     
     fresh = winning_df[~winning_df['ticker'].isin(existing)]
     
-    # ALLOCATION MATH FIX
+    # ALLOCATION MATH
     planned_trades = min(len(fresh), 20)
     if planned_trades == 0: 
         return "No new setups.", port_html
@@ -155,8 +154,9 @@ def execute_alpaca_trades(winning_df):
                     side=OrderSide.BUY, 
                     time_in_force=TimeInForce.GTC, 
                     order_class=OrderClass.BRACKET,
-                    # Base targets on the true scanned price, not the buffered price (4.5% / 1.5%)
+                    # TIGHTENED REWARD: 3.2%
                     take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.032, 2)),
+                    # WIDENED RISK: 1.5% 
                     stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
                 client.submit_order(req)
@@ -214,8 +214,11 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                # Volume/Price Filter
-                if price < 1.0 or avg_vol < 100000: continue
+                # 1. Strict Liquidity Filter: Minimum 500k average daily volume
+                if price < 1.0 or avg_vol < 500000: continue
+                
+                # 2. Momentum Filter: Today's volume must be at least 1.5x the average
+                if (df['Volume'].iloc[-1] / avg_vol) < 1.5: continue
                 
                 stats["passed_volume_filter"] += 1
                 
@@ -300,4 +303,3 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
 
 if __name__ == "__main__":
     run_main()
-
