@@ -2,9 +2,9 @@ name: Daily Market Close Sniper
 
 on:
   schedule:
-    # Triggers at 19:30 and 20:30 UTC (2:30 PM / 3:30 PM EST)
-    # The Python script handles the exact waiting and DST logic.
-    - cron: '30 19,20 * * 1-5'
+    # Triggers at 19:00 and 20:00 UTC 
+    # Gives the Python script a full 55-minute buffer to beat the GitHub queue.
+    - cron: '0 19,20 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,6 @@ jobs:
           python-version: '3.12'
 
       - name: Install Dependencies
-        # 100% Alpaca Data. yfinance is gone.
         run: pip install pandas lxml requests pytz alpaca-py pandas-ta
 
       - name: Run Scan and Trade
