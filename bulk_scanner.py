@@ -24,8 +24,8 @@ def is_market_closing_soon():
     tz_ny = pytz.timezone('America/New_York')
     now_ny = datetime.now(tz_ny)
     
-    # Target execution time: Exactly 3:45:00 PM NY Time
-    target_time = now_ny.replace(hour=15, minute=45, second=0, microsecond=0)
+    # Target execution time: Exactly 3:55:00 PM NY Time (2:55 PM CT)
+    target_time = now_ny.replace(hour=15, minute=55, second=0, microsecond=0)
     cutoff_time = now_ny.replace(hour=15, minute=59, second=59, microsecond=0)
 
     # Bypass for testing (Uncomment to force run outside hours)
@@ -35,15 +35,16 @@ def is_market_closing_soon():
     if now_ny > cutoff_time:
         return False, f"Too late. Market closed. ({now_ny.strftime('%I:%M %p')})"
 
-    # 2. Too early? (Before 3:45 PM)
+    # 2. Too early? (Before 3:55 PM)
     if now_ny < target_time:
         sleep_seconds = (target_time - now_ny).total_seconds()
         
         # DST Collision Preventer
-        if sleep_seconds > 3000:
+        # Increased to 4200 seconds (70 minutes) to allow for the 55-minute queue buffer
+        if sleep_seconds > 4200:
             return False, "Too early (Wrong DST schedule). Exiting silently."
             
-        print(f"⏰ GitHub started early. Sleeping for {sleep_seconds/60:.1f} minutes until exactly 3:45 PM NY Time...")
+        print(f"⏰ GitHub started early. Sleeping for {sleep_seconds/60:.1f} minutes until exactly 3:55 PM NY Time...")
         time.sleep(sleep_seconds)
         now_ny = datetime.now(tz_ny)
 
@@ -154,9 +155,7 @@ def execute_alpaca_trades(winning_df):
                     side=OrderSide.BUY, 
                     time_in_force=TimeInForce.GTC, 
                     order_class=OrderClass.BRACKET,
-                    # TIGHTENED REWARD: 3.2%
                     take_profit=TakeProfitRequest(limit_price=round(stock['price'] * 1.032, 2)),
-                    # WIDENED RISK: 1.5% 
                     stop_loss=StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
                 client.submit_order(req)
@@ -303,4 +302,3 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
 
 if __name__ == "__main__":
     run_main()
-
