@@ -28,19 +28,11 @@ def is_market_closing_soon():
     target_time = now_ny.replace(hour=15, minute=55, second=0, microsecond=0)
     cutoff_time = now_ny.replace(hour=15, minute=59, second=59, microsecond=0)
 
-    # Bypass for testing (Uncomment to force run outside hours)
-    # return True, "DEBUG OVERRIDE"
-
-    # 1. Too late? (After 4:00 PM)
     if now_ny > cutoff_time:
         return False, f"Too late. Market closed. ({now_ny.strftime('%I:%M %p')})"
 
-    # 2. Too early? (Before 3:55 PM)
     if now_ny < target_time:
         sleep_seconds = (target_time - now_ny).total_seconds()
-        
-        # DST Collision Preventer
-        # Increased to 4200 seconds (70 minutes) to allow for the 55-minute queue buffer
         if sleep_seconds > 4200:
             return False, "Too early (Wrong DST schedule). Exiting silently."
             
@@ -48,7 +40,6 @@ def is_market_closing_soon():
         time.sleep(sleep_seconds)
         now_ny = datetime.now(tz_ny)
 
-    # 3. Exactly on time
     return True, now_ny.strftime("%I:%M %p %Z")
 
 # --- 2. ALPACA DATA ENGINE ---
@@ -70,22 +61,46 @@ def get_alpaca_data(symbols, days_back=365):
     except Exception as e:
         return pd.DataFrame()
 
-# --- 3. MARKET TIDE ---
-def get_market_tide():
-    df = get_alpaca_data(["SPY", "QQQ"], days_back=40)
+# --- 3. THE REGIME FILTER ---
+def get_market_regime():
+    df = get_alpaca_data(["SPY"], days_back=60)
     if df.empty or "SPY" not in df.index.levels[0]:
-        return True, "⚠️ Tide Check Failed. Assuming Neutral."
+        return "CHOPPY", "⚠️ Regime Check Failed. Defaulting to CHOPPY."
+    
     try:
-        spy_df = df.loc["SPY"]
-        spy_close = spy_df['close'].iloc[-1]
-        spy_sma20 = spy_df['close'].rolling(20).mean().iloc[-1]
+        spy_df = df.loc["SPY"].copy()
         
-        status_msg = f"SPY: ${spy_close:.2f} (SMA20: ${spy_sma20:.2f})"
-        if spy_close > spy_sma20:
-            return True, f"✅ MARKET HEALTHY. {status_msg}"
-        return False, f"⛔ MARKET DOWN. {status_msg}"
+        # Calculate ADX, +DI, -DI, and SMA20 for SPY
+        spy_df.ta.adx(length=14, append=True)
+        spy_df.ta.sma(length=20, append=True)
+        
+        # Extract latest values
+        today = spy_df.iloc[-1]
+        adx = today.get('ADX_14', 0)
+        plus_di = today.get('DMP_14', 0)
+        minus_di = today.get('DMN_14', 0)
+        close = today['close']
+        sma20 = today.get('SMA_20', close)
+        
+        status_msg = f"SPY: ${close:.2f} | ADX: {adx:.1f} | +DI: {plus_di:.1f} | -DI: {minus_di:.1f} | SMA20: ${sma20:.2f}"
+        
+        # 1. Choppy / Range-Bound
+        if adx < 20:
+            return "CHOPPY", f"🟡 MARKET CHOPPY (No Trend). {status_msg}"
+            
+        # 2. Trending Up
+        elif close > sma20 and plus_di > minus_di:
+            return "UPTREND", f"🟢 MARKET UPTREND. {status_msg}"
+            
+        # 3. Trending Down
+        elif close < sma20 and minus_di > plus_di:
+            return "DOWNTREND", f"🔴 MARKET DOWNTREND. {status_msg}"
+            
+        else:
+            return "CHOPPY", f"🟡 MARKET TRANSITIONING. {status_msg}"
+            
     except Exception as e:
-        return True, f"⚠️ Tide Check Error. Assuming Neutral."
+        return "CHOPPY", f"⚠️ Regime Math Error. Defaulting to CHOPPY."
 
 # --- 4. PRO INDICATORS ---
 def calculate_indicators(df):
@@ -94,10 +109,14 @@ def calculate_indicators(df):
         df.ta.adx(length=14, append=True)
         df.ta.sma(length=10, append=True)
         df.ta.sma(length=20, append=True)
+        df.ta.rsi(length=14, append=True) # Added RSI for Mean Reversion
         
         df['ADX'] = df['ADX_14'] if 'ADX_14' in df.columns else 0
+        df['+DI'] = df['DMP_14'] if 'DMP_14' in df.columns else 0
+        df['-DI'] = df['DMN_14'] if 'DMN_14' in df.columns else 0
         df['SMA10'] = df['SMA_10'] if 'SMA_10' in df.columns else 0
         df['SMA20'] = df['SMA_20'] if 'SMA_20' in df.columns else 0
+        df['RSI'] = df['RSI_14'] if 'RSI_14' in df.columns else 50
     except:
         return df
     return df
@@ -110,7 +129,6 @@ def execute_alpaca_trades(winning_df):
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client = TradingClient(api_key, secret_key, paper=True) 
     
-    # SURGICAL CANCEL: Only cancel rogue BUY orders, leave active SELL targets alone
     open_orders = client.get_orders()
     for order in open_orders:
         if order.side == OrderSide.BUY:
@@ -126,7 +144,6 @@ def execute_alpaca_trades(winning_df):
     
     fresh = winning_df[~winning_df['ticker'].isin(existing)]
     
-    # ALLOCATION MATH
     planned_trades = min(len(fresh), 20)
     if planned_trades == 0: 
         return "No new setups.", port_html
@@ -137,7 +154,6 @@ def execute_alpaca_trades(winning_df):
     if equity < 30000 and int(account.daytrade_count) >= 2:
         return f"BLOCKED: PDT Active.", port_html
     
-    # Dynamically divides equity among planned trades, strictly capped at $1,000 per stock
     slot_size = min((equity / planned_trades), 1000.00)
     log = []
 
@@ -145,9 +161,7 @@ def execute_alpaca_trades(winning_df):
         try:
             qty = int(slot_size / stock['price'])
             if qty > 0:
-                # 0.2% buffer guarantees fill while protecting against massive slippage
                 safe_entry_price = round(stock['price'] * 1.002, 2)
-
                 req = LimitOrderRequest(
                     symbol=stock['ticker'], 
                     qty=qty, 
@@ -171,10 +185,16 @@ def run_main():
         print(f"Skipping: {time_msg}")
         return
 
-    tide_safe, tide_msg = get_market_tide()
+    # Evaluate the Market Regime
+    regime, regime_msg = get_market_regime()
     
-    ticker_file = "tickers.txt"
-    if not os.path.exists(ticker_file): return
+    # Route to the correct ticker file based on Regime
+    ticker_file = "tickersdown.txt" if regime == "DOWNTREND" else "tickers.txt"
+    
+    if not os.path.exists(ticker_file): 
+        print(f"Missing {ticker_file}")
+        return
+        
     with open(ticker_file, 'r') as f:
         all_tickers = [line.strip().upper() for line in f if line.strip()]
 
@@ -182,10 +202,11 @@ def run_main():
     error_log = []
     
     stats = {
+        "regime": regime,
         "total_scanned": len(all_tickers),
         "valid_downloads": 0,
         "passed_volume_filter": 0,
-        "passed_trend_filter": 0,
+        "passed_regime_strategy": 0,
         "passed_backtest": 0
     }
     
@@ -193,14 +214,11 @@ def run_main():
         batch = all_tickers[i:i+BATCH_SIZE]
         batch_data = get_alpaca_data(batch, days_back=365)
         
-        if batch_data.empty:
-            error_log.append(f"Batch {i}: FAILED")
-            continue
+        if batch_data.empty: continue
 
         for symbol in batch:
             try:
                 if symbol not in batch_data.index.levels[0]: continue
-                
                 stats["valid_downloads"] += 1
                 
                 df = batch_data.loc[symbol].copy()
@@ -213,10 +231,8 @@ def run_main():
                 price = df['Close'].iloc[-1]
                 avg_vol = df['Volume'].iloc[-21:-1].mean()
                 
-                # 1. Strict Liquidity Filter: Minimum 500k average daily volume
+                # Strict Liquidity & Momentum Filters
                 if price < 1.0 or avg_vol < 500000: continue
-                
-                # 2. Momentum Filter: Today's volume must be at least 1.3x the average
                 if (df['Volume'].iloc[-1] / avg_vol) < 1.3: continue
                 
                 stats["passed_volume_filter"] += 1
@@ -225,11 +241,32 @@ def run_main():
                 today = df.iloc[-1]
                 yesterday = df.iloc[-2]
                 
-                # Trend Filter
-                if (today['Close'] > today['SMA10'] > today['SMA20']) and (today['ADX'] > yesterday['ADX']):
-                    stats["passed_trend_filter"] += 1
+                passed_strategy = False
+                
+                # STRATEGY 1: UPTREND or DOWNTREND (Momentum)
+                # Note: We use upward momentum for DOWNTREND too, because tickersdown.txt should hold inverse ETFs.
+                if regime in ["UPTREND", "DOWNTREND"]:
+                    # ADX rising, +DI > -DI, Price above moving averages
+                    if (today['Close'] > today['SMA10'] > today['SMA20']) and \
+                       (today['+DI'] > today['-DI']) and \
+                       (today['ADX'] > yesterday['ADX']):
+                        passed_strategy = True
+                        
+                # STRATEGY 2: CHOPPY (Mean Reversion)
+                elif regime == "CHOPPY":
+                    # Deeply oversold (RSI < 35) but still fundamentally holding above a catastrophic crash
+                    if today['RSI'] < 35 and today['Close'] > (today['SMA20'] * 0.85):
+                        passed_strategy = True
+
+                if passed_strategy:
+                    stats["passed_regime_strategy"] += 1
                     
-                    hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['ADX'] > df['ADX'].shift(1))].index
+                    # Backtest logic matches the strategy triggered
+                    if regime in ["UPTREND", "DOWNTREND"]:
+                        hist = df[(df['Close'] > df['SMA10']) & (df['SMA10'] > df['SMA20']) & (df['+DI'] > df['-DI']) & (df['ADX'] > df['ADX'].shift(1))].index
+                    else:
+                        hist = df[(df['RSI'] < 35) & (df['Close'] > (df['SMA20'] * 0.85))].index
+                        
                     wins, total = 0, 0
                     for d in hist:
                         idx = df.index.get_loc(d)
@@ -253,15 +290,14 @@ def run_main():
         res_df = res_df.sort_values(by="win_rate", ascending=False)
 
     trade_log, port_html = execute_alpaca_trades(res_df)
-    send_email(res_df, trade_log, port_html, time_msg, tide_msg, tide_safe, error_log, stats)
+    send_email(res_df, trade_log, port_html, time_msg, regime_msg, regime, error_log, stats)
 
 # --- EMAIL HELPER ---
-def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error_log, stats):
+def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, error_log, stats):
     msg = EmailMessage()
     hits = len(res_df) if not res_df.empty else 0
     
-    subject = f"Sniper Report: {hits} Hits"
-    if not tide_safe: subject = f"📉 Bear Scan: {hits} Hits"
+    subject = f"[{regime}] Sniper Report: {hits} Hits"
 
     msg['Subject'] = subject
     msg['From'] = os.environ.get('EMAIL_USER')
@@ -271,15 +307,15 @@ def send_email(res_df, trade_log, port_html, ny_time, tide_msg, tide_safe, error
 
     body = f"""
     <h3>Run Complete ({ny_time})</h3>
-    <p><b>Market Tide:</b> {tide_msg}</p>
+    <p><b>Market Regime:</b> {regime_msg}</p>
     
     <div style="background: #f9f9f9; padding: 15px; border: 1px solid #ddd;">
         <h4 style="margin-top: 0;">Diagnostic Funnel (The Proof)</h4>
         <ul style="margin-bottom: 0;">
             <li><b>Attempted:</b> {stats['total_scanned']} tickers</li>
             <li><b>Valid Downloads:</b> {stats['valid_downloads']}</li>
-            <li><b>Passed Volume Check:</b> {stats['passed_volume_filter']}</li>
-            <li><b>Passed Trend Check:</b> {stats['passed_trend_filter']}</li>
+            <li><b>Passed Volume/RVOL:</b> {stats['passed_volume_filter']}</li>
+            <li><b>Passed {regime} Strategy:</b> {stats['passed_regime_strategy']}</li>
             <li><b>Passed Backtest:</b> {stats['passed_backtest']}</li>
         </ul>
     </div>
