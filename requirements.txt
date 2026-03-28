@@ -1,6 +1,6 @@
-yfinance
 pandas
+pandas-ta
 numpy
-lxml
-alpaca-py
+requests
 pytz
+alpaca-py
