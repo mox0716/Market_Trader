@@ -543,13 +543,13 @@ def run_main():
  
                 # ── LIQUIDITY GATE ──────────────────────────────────────────
                 # Price $5–$500: avoids penny stock chaos and index-fund noise
-                if not (5.0 <= price <= 500.0):
+                if not (2.0 <= price <= 500.0):
                     continue
                 # Avg daily volume ≥ 750k: tighter than before for real liquidity
-                if avg_vol < 750_000:
+                if avg_vol < 500_000:
                     continue
                 # RVOL ≥ 1.5x: something is happening today — not a quiet drift
-                if rvol < 1.5:
+                if rvol < 1.3:
                     continue
  
                 stats["passed_liquidity"] += 1
@@ -575,7 +575,7 @@ def run_main():
                     stats["passed_backtest"] += 1
                     all_hits.append({
                         "ticker":     symbol,
-                        "price":      round(price, 2),
+                        "price":      round(price, 3),
                         "rvol":       metrics["rvol"],
                         "win_rate":   metrics["win_rate"],
                         "avg_return": metrics["avg_return"],
@@ -681,7 +681,7 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
                 <td style="padding:4px 8px; font-weight:bold;">{stats['total_scanned']:,}</td></tr>
             <tr style="background:#fff;"><td style="padding:4px 8px;">Valid Downloads</td>
                 <td style="padding:4px 8px; font-weight:bold;">{stats['valid_downloads']:,}</td></tr>
-            <tr><td style="padding:4px 8px;">Passed Liquidity (price $5–$500, vol ≥750k, RVOL ≥1.5x)</td>
+            <tr><td style="padding:4px 8px;">Passed Liquidity (price $2–$500, vol ≥500k, RVOL ≥1.3x)</td>
                 <td style="padding:4px 8px; font-weight:bold;">{stats['passed_liquidity']:,}</td></tr>
             <tr style="background:#fff;"><td style="padding:4px 8px;">Passed Candle Quality (close ≥60% range, ATR &lt;8%)</td>
                 <td style="padding:4px 8px; font-weight:bold;">{stats['passed_candle_quality']:,}</td></tr>
@@ -709,7 +709,7 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
     {port_html}
  
     <p style="font-size:11px; color:#aaa; margin-top:20px;">
-        MIN_WIN_RATE={MIN_WIN_RATE}% | MIN_SAMPLES={MIN_SAMPLES} | TOP_N={TOP_N_TRADES} |
+        MIN_WIN_RATE={MIN_WIN_RATE}% | MIN_SAMPLES={MIN_SAMPLES} | TOP_N={TOP_N_TRADES} | Price $2+ | Vol 500k+ | RVOL 1.3x+ |
         Bracket: TP +3.2% / SL -1.5% | Entry limit +0.2%
     </p>
     """
@@ -721,3 +721,4 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
  
 if __name__ == "__main__":
     run_main()
+ 
