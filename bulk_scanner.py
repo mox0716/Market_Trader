@@ -504,6 +504,7 @@ def run_main():
     stats = {
         "regime":                 regime,
         "total_scanned":          len(all_tickers),
+        "failed_batches":         0,
         "valid_downloads":        0,
         "passed_liquidity":       0,
         "passed_candle_quality":  0,
@@ -516,6 +517,7 @@ def run_main():
         batch_data = get_alpaca_data(batch, days_back=365)
  
         if batch_data.empty:
+            stats["failed_batches"] += 1
             continue
  
         for symbol in batch:
@@ -543,7 +545,7 @@ def run_main():
  
                 # ── LIQUIDITY GATE ──────────────────────────────────────────
                 # Price $5–$500: avoids penny stock chaos and index-fund noise
-                if not (3.0 <= price <= 500.0):
+                if not (2.0 <= price <= 500.0):
                     continue
                 # Avg daily volume ≥ 750k: tighter than before for real liquidity
                 if avg_vol < 500_000:
@@ -689,6 +691,8 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
                 <td style="padding:4px 8px; font-weight:bold;">{stats['passed_strategy']:,}</td></tr>
             <tr style="background:#fff;"><td style="padding:4px 8px;">Passed Backtest (WR ≥{int(MIN_WIN_RATE)}%, avg return &gt;0, n≥{MIN_SAMPLES})</td>
                 <td style="padding:4px 8px; font-weight:bold; color:green;">{stats['passed_backtest']:,}</td></tr>
+            <tr><td style="padding:4px 8px;">Failed Batches (empty API response)</td>
+                <td style="padding:4px 8px; font-weight:bold; color:{'red' if stats['failed_batches'] > 0 else 'inherit'};">{stats['failed_batches']} / {len(all_tickers) // BATCH_SIZE + 1}</td></tr>
         </table>
     </div>
  
@@ -721,4 +725,3 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
  
 if __name__ == "__main__":
     run_main()
- 
