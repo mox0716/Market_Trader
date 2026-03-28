@@ -543,7 +543,7 @@ def run_main():
  
                 # ── LIQUIDITY GATE ──────────────────────────────────────────
                 # Price $5–$500: avoids penny stock chaos and index-fund noise
-                if not (2.0 <= price <= 500.0):
+                if not (3.0 <= price <= 500.0):
                     continue
                 # Avg daily volume ≥ 750k: tighter than before for real liquidity
                 if avg_vol < 500_000:
@@ -575,7 +575,7 @@ def run_main():
                     stats["passed_backtest"] += 1
                     all_hits.append({
                         "ticker":     symbol,
-                        "price":      round(price, 3),
+                        "price":      round(price, 2),
                         "rvol":       metrics["rvol"],
                         "win_rate":   metrics["win_rate"],
                         "avg_return": metrics["avg_return"],
