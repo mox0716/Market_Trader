@@ -1,32 +1,44 @@
 name: Daily Market Close Sniper
-
+ 
 on:
   schedule:
-    # Triggers at 19:00 and 20:00 UTC 
-    # Gives the Python script a full 55-minute buffer to beat the GitHub queue.
+    # Triggers at 19:00 and 20:00 UTC (covers both EST and EDT automatically)
+    # Gives the Python script a full buffer to sleep until exactly 3:55 PM NY time
     - cron: '0 19,20 * * 1-5'
+ 
   workflow_dispatch:
-
+    inputs:
+      dry_run:
+        description: 'Dry run — bypass time gate, scan for real but skip order placement'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+ 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-
+        uses: actions/checkout@v4
+ 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install Dependencies
+ 
+      - name: Install dependencies
         run: pip install pandas lxml requests pytz alpaca-py pandas-ta
-
-      - name: Run Scan and Trade
+ 
+      - name: Run scan and trade
         env:
-          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_KEY:   ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+          EMAIL_USER:       ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS:       ${{ secrets.EMAIL_PASS }}
+          EMAIL_RECEIVER:   ${{ secrets.EMAIL_RECEIVER }}
+          DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
         run: python bulk_scanner.py
+ 
