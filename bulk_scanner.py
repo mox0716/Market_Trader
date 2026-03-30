@@ -504,6 +504,7 @@ def run_main():
     stats = {
         "regime":                 regime,
         "total_scanned":          len(all_tickers),
+        "total_batches":          (len(all_tickers) + BATCH_SIZE - 1) // BATCH_SIZE,
         "failed_batches":         0,
         "valid_downloads":        0,
         "passed_liquidity":       0,
@@ -692,7 +693,7 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
             <tr style="background:#fff;"><td style="padding:4px 8px;">Passed Backtest (WR ≥{int(MIN_WIN_RATE)}%, avg return &gt;0, n≥{MIN_SAMPLES})</td>
                 <td style="padding:4px 8px; font-weight:bold; color:green;">{stats['passed_backtest']:,}</td></tr>
             <tr><td style="padding:4px 8px;">Failed Batches (empty API response)</td>
-                <td style="padding:4px 8px; font-weight:bold; color:{'red' if stats['failed_batches'] > 0 else 'inherit'};">{stats['failed_batches']} / {len(all_tickers) // BATCH_SIZE + 1}</td></tr>
+                <td style="padding:4px 8px; font-weight:bold; color:{'red' if stats['failed_batches'] > 0 else 'inherit'};">{stats['failed_batches']} / {stats['total_batches']}</td></tr>
         </table>
     </div>
  
@@ -725,3 +726,4 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
  
 if __name__ == "__main__":
     run_main()
+ 
