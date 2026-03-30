@@ -29,6 +29,10 @@ W_AVG_RETURN  = 0.30
 W_RVOL        = 0.15
 W_CONSISTENCY = 0.15   # Penalizes high variance in historical returns
  
+# Set DRY_RUN=true in GitHub Actions workflow_dispatch to test outside market hours.
+# Bypasses the time gate and skips order placement — everything else runs for real.
+DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+ 
  
 # ==============================================================================
 # 1. THE BOUNCER (SMART WAITER) — unchanged, works fine
@@ -458,13 +462,21 @@ def execute_alpaca_trades(winning_df, regime):
                     take_profit    = TakeProfitRequest(limit_price=round(stock['price'] * 1.032, 2)),
                     stop_loss      = StopLossRequest(stop_price=round(stock['price'] * 0.985, 2))
                 )
-                client.submit_order(req)
-                log.append(
-                    f"✅ BUY {qty} {stock['ticker']} @ ≤${safe_entry} | "
-                    f"TP: ${round(stock['price']*1.032,2)} | "
-                    f"SL: ${round(stock['price']*0.985,2)} | "
-                    f"Score: {stock.get('score','?')} | WR: {stock.get('win_rate','?')}%"
-                )
+                if DRY_RUN:
+                    log.append(
+                        f"\U0001f9ea [DRY RUN] WOULD BUY {qty} {stock['ticker']} @ \u2264${safe_entry} | "
+                        f"TP: ${round(stock['price']*1.032,2)} | "
+                        f"SL: ${round(stock['price']*0.985,2)} | "
+                        f"Score: {stock.get('score','?')} | WR: {stock.get('win_rate','?')}%"
+                    )
+                else:
+                    client.submit_order(req)
+                    log.append(
+                        f"\u2705 BUY {qty} {stock['ticker']} @ \u2264${safe_entry} | "
+                        f"TP: ${round(stock['price']*1.032,2)} | "
+                        f"SL: ${round(stock['price']*0.985,2)} | "
+                        f"Score: {stock.get('score','?')} | WR: {stock.get('win_rate','?')}%"
+                    )
         except Exception as e:
             log.append(f"❌ ERR {stock['ticker']}: {e}")
  
@@ -475,10 +487,14 @@ def execute_alpaca_trades(winning_df, regime):
 # 7. MAIN LOGIC
 # ==============================================================================
 def run_main():
-    is_time, time_msg = is_market_closing_soon()
-    if not is_time:
-        print(f"Skipping: {time_msg}")
-        return
+    if DRY_RUN:
+        print("\U0001f9ea DRY RUN MODE \u2014 time gate bypassed, no orders will be placed.")
+        time_msg = datetime.now(pytz.timezone('America/New_York')).strftime("%I:%M %p %Z") + " [DRY RUN]"
+    else:
+        is_time, time_msg = is_market_closing_soon()
+        if not is_time:
+            print(f"Skipping: {time_msg}")
+            return
  
     regime, regime_msg = get_market_regime()
  
@@ -640,7 +656,8 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
         "CHOPPY":    "Mean Reversion (Bollinger/Stoch/RSI)",
     }.get(regime, "Unknown")
  
-    msg['Subject'] = f"{regime_emoji} [{regime}] Sniper: {hits} candidates → {min(hits, TOP_N_TRADES)} trades"
+    dry_tag = ' [DRY RUN]' if DRY_RUN else ''
+    msg['Subject'] = f"{regime_emoji} [{regime}] Sniper: {hits} candidates → {min(hits, TOP_N_TRADES)} trades{dry_tag}"
     msg['From']    = os.environ.get('EMAIL_USER')
     msg['To']      = os.environ.get('EMAIL_RECEIVER')
  
@@ -671,6 +688,7 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
     }.get(regime, "")
  
     body = f"""
+    {'<div style="background:#fff3cd; border:1px solid #ffc107; border-radius:4px; padding:10px 14px; margin-bottom:12px;">🧪 <strong>DRY RUN — no orders were placed.</strong> This is a test run outside market hours.</div>' if DRY_RUN else ''}
     <h3>{regime_emoji} Sniper Report — {ny_time}</h3>
     <p><b>Market Regime:</b> {regime_msg}</p>
     <p style="background:#f0f0f0; padding:10px; border-left:4px solid #666;">
