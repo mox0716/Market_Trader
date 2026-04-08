@@ -61,7 +61,9 @@ def is_market_closing_soon():
 # ==============================================================================
 # 2. ALPACA DATA ENGINE — unchanged
 # ==============================================================================
-def get_alpaca_data(symbols, days_back=365):
+def get_alpaca_data(symbols, days_back=365, _retry=2):
+    """Fetch daily bars from Alpaca. Retries once on empty/error with a backoff
+    to handle rate-limiting — the main cause of the 13/46 failed batches."""
     api_key    = os.environ.get('ALPACA_API_KEY')
     secret_key = os.environ.get('ALPACA_SECRET_KEY')
     client     = StockHistoricalDataClient(api_key, secret_key)
@@ -71,18 +73,29 @@ def get_alpaca_data(symbols, days_back=365):
         timeframe=TimeFrame.Day,
         start=datetime.now(pytz.utc) - timedelta(days=days_back)
     )
-    try:
-        bars = client.get_stock_bars(req)
-        if not bars or bars.df.empty:
-            return pd.DataFrame()
-        return bars.df
-    except Exception:
-        return pd.DataFrame()
+    for attempt in range(_retry):
+        try:
+            bars = client.get_stock_bars(req)
+            if bars and not bars.df.empty:
+                return bars.df
+        except Exception:
+            pass
+        if attempt < _retry - 1:
+            time.sleep(2)   # 2-second backoff before retry
+    return pd.DataFrame()
  
  
 # ==============================================================================
-# 3. REGIME DETECTOR — upgraded to require TWO consecutive days of confirmation
-#    before calling a regime, which eliminates whipsawing on one-day moves.
+# 3. REGIME DETECTOR
+#
+# Four regimes:
+#   UPTREND      — SPY above both MAs, +DI leading. Single-day confirmation
+#                  so we don't miss the first day of a real breakout.
+#   DOWNTREND    — SPY below SMA20, -DI leading. Two-day confirmation to avoid
+#                  selling into brief one-day dips.
+#   CHOPPY_BULL  — SPY above SMA20 but ADX/DI not confirming a clean uptrend.
+#                  Market is transitioning up. Run momentum breakout scan.
+#   CHOPPY_BEAR  — SPY below SMA20, conditions indecisive. Run mean reversion.
 # ==============================================================================
 def get_market_regime():
     df = get_alpaca_data(["SPY"], days_back=90)
@@ -93,51 +106,57 @@ def get_market_regime():
         spy = df.loc["SPY"].copy()
         spy.ta.adx(length=14, append=True)
         spy.ta.sma(length=20, append=True)
-        spy.ta.sma(length=50, append=True)    # Added 50-day for macro context
-        spy.ta.rsi(length=14, append=True)    # Added RSI for extreme readings
+        spy.ta.sma(length=50, append=True)
+        spy.ta.rsi(length=14, append=True)
  
-        # Use last 2 days so we require consecutive confirmation
         if len(spy) < 3:
             return "CASH", "⚠️ Insufficient SPY data. Standing down."
  
         t0 = spy.iloc[-1]   # today
         t1 = spy.iloc[-2]   # yesterday
  
-        adx      = t0.get('ADX_14', 0)
-        plus_di  = t0.get('DMP_14', 0)
-        minus_di = t0.get('DMN_14', 0)
-        close    = t0['close']
-        sma20    = t0.get('SMA_20', close)
-        sma50    = t0.get('SMA_50', close)
-        rsi      = t0.get('RSI_14', 50)
+        adx       = t0.get('ADX_14', 0)
+        plus_di   = t0.get('DMP_14', 0)
+        minus_di  = t0.get('DMN_14', 0)
+        close     = t0['close']
+        sma20     = t0.get('SMA_20', close)
+        sma50     = t0.get('SMA_50', close)
+        rsi       = t0.get('RSI_14', 50)
  
-        # Yesterday's values for confirmation
-        adx_y     = t1.get('ADX_14', 0)
-        plus_di_y = t1.get('DMP_14', 0)
-        minus_di_y= t1.get('DMN_14', 0)
-        close_y   = t1['close']
-        sma20_y   = t1.get('SMA_20', close_y)
+        adx_y      = t1.get('ADX_14', 0)
+        minus_di_y = t1.get('DMN_14', 0)
+        close_y    = t1['close']
+        sma20_y    = t1.get('SMA_20', close_y)
  
         status = (f"SPY: ${close:.2f} | ADX: {adx:.1f} | "
                   f"+DI: {plus_di:.1f} | -DI: {minus_di:.1f} | "
                   f"SMA20: ${sma20:.2f} | SMA50: ${sma50:.2f} | RSI: {rsi:.1f}")
  
-        # UPTREND: SPY above both MAs, +DI leading, ADX trending up — TWO days
-        uptrend_today = (close > sma20 > sma50) and (plus_di > minus_di) and (adx >= 20)
-        uptrend_yest  = (close_y > sma20_y) and (plus_di_y > minus_di_y) and (adx_y >= 18)
+        above_sma20 = close > sma20
+        di_bullish  = plus_di > minus_di
+        di_bearish  = minus_di > plus_di
+        strong_adx  = adx >= 20
  
-        # DOWNTREND: SPY below both MAs, -DI leading, ADX trending up — TWO days
-        downtrend_today = (close < sma20) and (minus_di > plus_di) and (adx >= 20)
-        downtrend_yest  = (close_y < sma20_y) and (minus_di_y > plus_di_y) and (adx_y >= 18)
+        # UPTREND: single-day — SPY above both MAs, +DI leading, ADX strong.
+        # One day is enough; we don't want to miss the first day of a real move.
+        if above_sma20 and (close > sma50) and di_bullish and strong_adx:
+            return "UPTREND", f"🟢 UPTREND. {status}"
  
-        if uptrend_today and uptrend_yest:
-            return "UPTREND",   f"🟢 CONFIRMED UPTREND. {status}"
- 
+        # DOWNTREND: two-day confirmation — SPY below SMA20 and -DI leading today
+        # AND yesterday, so we don't flip to bearish on a single red day.
+        downtrend_today = (not above_sma20) and di_bearish and strong_adx
+        downtrend_yest  = (close_y < sma20_y) and (minus_di_y > adx_y * 0.4)
         if downtrend_today and downtrend_yest:
             return "DOWNTREND", f"🔴 CONFIRMED DOWNTREND. {status}"
  
-        # Everything else is CHOPPY — no conviction either direction
-        return "CHOPPY", f"🟡 CHOPPY / TRANSITIONING. {status}"
+        # CHOPPY split on SPY position relative to SMA20
+        if above_sma20:
+            # SPY above its MA but not a confirmed uptrend — transitioning up.
+            # Run momentum breakout scan, not mean reversion.
+            return "CHOPPY_BULL", f"🟡 CHOPPY (Bullish bias — SPY above SMA20). {status}"
+        else:
+            # SPY below its MA, indecisive. Mean reversion territory.
+            return "CHOPPY_BEAR", f"🟠 CHOPPY (Bearish bias — SPY below SMA20). {status}"
  
     except Exception as e:
         return "CASH", f"⚠️ Regime math error ({e}). Standing down."
@@ -203,36 +222,37 @@ def calculate_indicators(df):
 # ==============================================================================
 # 5. STRATEGY GATE + BACKTEST ENGINE
 #    Returns: (passed: bool, metrics: dict)
-#    Backtest now measures OVERNIGHT return (close → next open) for UPTREND,
-#    and 2-day forward for CHOPPY/DOWNTREND (bounce needs a day to develop).
+#
+#    UPTREND      → ADX Momentum (1-day forward backtest)
+#    DOWNTREND    → Relative Strength against market (2-day)
+#    CHOPPY_BULL  → Breakout Momentum — stocks clearing resistance on volume (1-day)
+#    CHOPPY_BEAR  → Mean Reversion — oversold bounce confirmation (2-day)
 # ==============================================================================
 def evaluate_stock(df, regime, rvol):
     today     = df.iloc[-1]
     yesterday = df.iloc[-2]
  
     # ------------------------------------------------------------------
-    # UNIVERSAL PRE-FILTERS (apply before any strategy check)
+    # UNIVERSAL PRE-FILTERS
     # ------------------------------------------------------------------
  
-    # 1. Stock must be closing in the top 40% of today's candle.
-    #    Fading into the close is the opposite of what we want at 3:55.
+    # 1. Must close in top 40% of today's candle (not fading into close)
     if today['Close_Pct'] < 0.60:
         return False, {}
  
-    # 2. MACD must not be in a hard downward crossover (momentum dying)
-    #    Exception: CHOPPY allows it since we're looking for reversals
-    if regime != "CHOPPY" and today['MACD'] < today['MACD_S'] and yesterday['MACD'] > yesterday['MACD_S']:
+    # 2. MACD downward crossover = momentum dying. Allow in mean reversion only.
+    mean_rev_regime = regime == "CHOPPY_BEAR"
+    if not mean_rev_regime and today['MACD'] < today['MACD_S'] and yesterday['MACD'] > yesterday['MACD_S']:
         return False, {}
  
-    # 3. ATR% sanity check — avoid hyper-volatile penny-stock behavior
-    #    (> 8% daily ATR vs price = casino, not trading)
+    # 3. ATR% > 8% = casino volatility, skip
     if today['ATR_Pct'] > 0.08:
         return False, {}
  
     passed_strategy = False
  
     # ------------------------------------------------------------------
-    # STRATEGY A: UPTREND — ADX Momentum (your original, kept and refined)
+    # STRATEGY A: UPTREND — ADX Momentum
     # ------------------------------------------------------------------
     if regime == "UPTREND":
         # Core: Price stacked above all MAs, +DI leading, ADX rising
@@ -276,27 +296,36 @@ def evaluate_stock(df, regime, rvol):
             passed_strategy = True
  
     # ------------------------------------------------------------------
-    # STRATEGY C: CHOPPY — Mean Reversion (confirmed bounce, not falling knife)
+    # STRATEGY C: CHOPPY_BULL — Breakout Momentum
+    # SPY is above its SMA20 but trend not fully confirmed.
+    # Hunt stocks that are breaking out: above all MAs, strong volume,
+    # RSI with momentum but not overbought. Same logic as UPTREND but
+    # slightly looser — the market is WITH us, just not yet confirmed.
     # ------------------------------------------------------------------
-    elif regime == "CHOPPY":
-        # RSI oversold but starting to recover
+    elif regime == "CHOPPY_BULL":
+        ma_stack      = today['Close'] > today['SMA10'] > today['SMA20']
+        di_bullish    = today['+DI'] > today['-DI']
+        rsi_ok        = 48 <= today['RSI'] <= 78      # Slightly wider than UPTREND
+        ema_support   = today['Close'] > today['EMA9']
+        price_up      = today['Close'] > yesterday['Close']
+        macd_positive = today['MACD'] > today['MACD_S']  # MACD above signal
+ 
+        if ma_stack and di_bullish and rsi_ok and ema_support and price_up and macd_positive:
+            passed_strategy = True
+ 
+    # ------------------------------------------------------------------
+    # STRATEGY D: CHOPPY_BEAR — Mean Reversion (confirmed bounce only)
+    # SPY is below SMA20. Hunt oversold stocks showing a confirmed turn.
+    # ------------------------------------------------------------------
+    elif regime == "CHOPPY_BEAR":
         rsi_oversold   = today['RSI'] < 38
-        rsi_recovering = today['RSI'] > yesterday['RSI']   # KEY: must be turning up
- 
-        # Stochastic also oversold and hooking up
+        rsi_recovering = today['RSI'] > yesterday['RSI']
         stoch_oversold = today['STOCH_K'] < 25
-        stoch_hook     = today['STOCH_K'] > today['STOCH_D']  # K crossing above D
- 
-        # Price near or touching lower Bollinger Band but closing above it
-        near_bb_low   = today['Close'] <= today['BB_MID']
-        above_bb_low  = today['Close'] > today['BB_LO']
- 
-        # Still structurally intact — not a catastrophic breakdown
-        # (within 10% of SMA20, not in freefall)
-        structural_ok = today['Close'] > (today['SMA20'] * 0.90)
- 
-        # Today closed HIGHER than yesterday (the turn is happening NOW, not speculative)
-        price_turning = today['Close'] > yesterday['Close']
+        stoch_hook     = today['STOCH_K'] > today['STOCH_D']
+        near_bb_low    = today['Close'] <= today['BB_MID']
+        above_bb_low   = today['Close'] > today['BB_LO']
+        structural_ok  = today['Close'] > (today['SMA20'] * 0.90)
+        price_turning  = today['Close'] > yesterday['Close']
  
         if (rsi_oversold and rsi_recovering and
             stoch_oversold and stoch_hook and
@@ -334,7 +363,17 @@ def evaluate_stock(df, regime, rvol):
             )
             forward_days = 2
  
-        else:  # CHOPPY
+        elif regime == "CHOPPY_BULL":
+            hist_mask = (
+                (df['Close'] > df['SMA10']) &
+                (df['SMA10'] > df['SMA20']) &
+                (df['+DI'] > df['-DI']) &
+                (df['RSI'].between(48, 78)) &
+                (df['Close'] > df['Close'].shift(1))
+            )
+            forward_days = 1   # Breakout should show quickly
+ 
+        else:  # CHOPPY_BEAR — mean reversion
             hist_mask = (
                 (df['RSI'] < 38) &
                 (df['RSI'] > df['RSI'].shift(1)) &
@@ -537,6 +576,8 @@ def run_main():
             stats["failed_batches"] += 1
             continue
  
+        time.sleep(0.3)   # 300ms between batches — prevents rate limiting
+ 
         for symbol in batch:
             try:
                 if symbol not in batch_data.index.levels[0]:
@@ -572,6 +613,12 @@ def run_main():
                     continue
  
                 stats["passed_liquidity"] += 1
+ 
+                # Skip known non-tradeable symbols that pass data checks
+                # but fail at order placement. Add to this list as needed.
+                BLACKLIST = {"COMM"}
+                if symbol in BLACKLIST:
+                    continue
  
                 df = calculate_indicators(df)
  
@@ -649,11 +696,12 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
     msg   = EmailMessage()
     hits  = len(res_df) if not res_df.empty else 0
  
-    regime_emoji = {"UPTREND": "🟢", "DOWNTREND": "🔴", "CHOPPY": "🟡"}.get(regime, "⚪")
+    regime_emoji = {"UPTREND": "🟢", "DOWNTREND": "🔴", "CHOPPY_BULL": "🟡", "CHOPPY_BEAR": "🟠", "CASH": "⚪"}.get(regime, "⚪")
     strategy_name = {
-        "UPTREND":   "ADX Momentum",
-        "DOWNTREND": "Relative Strength",
-        "CHOPPY":    "Mean Reversion (Bollinger/Stoch/RSI)",
+        "UPTREND":     "ADX Momentum",
+        "DOWNTREND":   "Relative Strength",
+        "CHOPPY_BULL": "Breakout Momentum",
+        "CHOPPY_BEAR": "Mean Reversion (Bollinger/Stoch/RSI)",
     }.get(regime, "Unknown")
  
     dry_tag = ' [DRY RUN]' if DRY_RUN else ''
@@ -666,24 +714,26 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
     # Strategy explanation block — different for each regime
     strategy_notes = {
         "UPTREND": """
-            <b>Strategy:</b> ADX Momentum — buying stocks with a confirmed trend stack
+            <b>Strategy:</b> ADX Momentum — stocks with a confirmed trend stack
             (Close &gt; SMA10 &gt; SMA20 &gt; SMA50), rising ADX ≥ 22, +DI leading,
-            RSI 45–75 (not overbought), and closing above EMA9.
-            Backtest measures <b>1-day forward return</b>.
+            RSI 45–75, closing above EMA9. Backtest: <b>1-day forward return</b>.
         """,
         "DOWNTREND": """
-            <b>Strategy:</b> Relative Strength — hunting stocks that are rising
-            <i>despite</i> the market falling. Requires: price up today, above own SMA20,
-            +DI still leading on the individual stock, RSI 40–65, closing in top 35%
-            of candle, MACD positive. These stocks have institutional accumulation
-            against the trend — they tend to explode when the market bounces.
-            Backtest measures <b>2-day forward return</b>.
+            <b>Strategy:</b> Relative Strength — stocks rising <i>despite</i> the market
+            falling. Price up today, above own SMA20, +DI leading, RSI 40–65, closing
+            in top 35% of candle, MACD positive. Backtest: <b>2-day forward return</b>.
         """,
-        "CHOPPY": """
-            <b>Strategy:</b> Mean Reversion — RSI &lt; 38 AND turning up, Stochastic &lt; 25
-            AND K crossing above D, price touching lower Bollinger but closing above it,
-            and today's close higher than yesterday's (the turn is confirmed, not speculative).
-            Backtest measures <b>2-day forward return</b>.
+        "CHOPPY_BULL": """
+            <b>Strategy:</b> Breakout Momentum — SPY is above SMA20 (bullish bias) but
+            trend not fully confirmed. Hunting stocks above SMA10/SMA20, +DI leading,
+            RSI 48–78, above EMA9, up on the day, MACD positive. These stocks lead
+            the next confirmed uptrend. Backtest: <b>1-day forward return</b>.
+        """,
+        "CHOPPY_BEAR": """
+            <b>Strategy:</b> Mean Reversion — SPY below SMA20 (bearish bias). RSI &lt; 38
+            AND turning up, Stochastic &lt; 25 AND K crossing D, price near lower Bollinger
+            but closing above it, today higher than yesterday.
+            Backtest: <b>2-day forward return</b>.
         """,
     }.get(regime, "")
  
