@@ -2,9 +2,23 @@ name: Daily Market Close Sniper
  
 on:
   schedule:
-    # Triggers at 19:00 and 20:00 UTC (covers both EST and EDT automatically)
-    # Gives the Python script a full buffer to sleep until exactly 3:55 PM NY time
-    - cron: '0 19,20 * * 1-5'
+    # Three triggers at 18:00, 19:00, and 20:00 UTC to cover both EST and EDT
+    # and absorb GitHub queue delays of up to 30+ minutes.
+    #
+    # EDT (summer): 18:00 UTC = 2:00 PM EDT  ← primary trigger, 115 min buffer
+    #               19:00 UTC = 3:00 PM EDT  ← backup
+    #               20:00 UTC = 4:00 PM EDT  ← too late, bouncer exits (safety net)
+    #
+    # EST (winter): 18:00 UTC = 1:00 PM EST  ← hits the 70-min sleep guard, exits
+    #               19:00 UTC = 2:00 PM EST  ← primary trigger, 115 min buffer
+    #               20:00 UTC = 3:00 PM EST  ← backup
+    #
+    # The Python bouncer handles everything: if it wakes up more than 70 minutes
+    # early it exits silently. If it wakes up within 70 minutes of 3:55 PM NY
+    # it sleeps until exactly 3:55 PM. If it's past 3:59 PM it exits.
+    # Multiple triggers firing the same day is fine — only the one that lands
+    # in the valid window will actually run the scan.
+    - cron: '0 18,19,20 * * 1-5'
  
   workflow_dispatch:
     inputs:
@@ -34,11 +48,10 @@ jobs:
  
       - name: Run scan and trade
         env:
-          ALPACA_API_KEY:   ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_KEY:    ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          EMAIL_USER:       ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS:       ${{ secrets.EMAIL_PASS }}
-          EMAIL_RECEIVER:   ${{ secrets.EMAIL_RECEIVER }}
-          DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
+          EMAIL_USER:        ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS:        ${{ secrets.EMAIL_PASS }}
+          EMAIL_RECEIVER:    ${{ secrets.EMAIL_RECEIVER }}
+          DRY_RUN:           ${{ github.event.inputs.dry_run || 'false' }}
         run: python bulk_scanner.py
- 
