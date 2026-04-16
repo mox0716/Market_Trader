@@ -49,8 +49,8 @@ def is_market_closing_soon():
  
     if now_ny < target_time:
         sleep_seconds = (target_time - now_ny).total_seconds()
-        if sleep_seconds > 4200:
-            return False, "Too early (Wrong DST schedule). Exiting silently."
+        if sleep_seconds > 9000:  # 150 min — covers 18:00 UTC trigger in both EST and EDT
+            return False, "Too early (more than 150 min before target). Exiting silently."
         print(f"⏰ GitHub started early. Sleeping {sleep_seconds/60:.1f} min until 3:55 PM NY...")
         time.sleep(sleep_seconds)
         now_ny = datetime.now(tz_ny)
@@ -794,4 +794,3 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
  
 if __name__ == "__main__":
     run_main()
- 
