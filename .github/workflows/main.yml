@@ -18,7 +18,7 @@ on:
     # it sleeps until exactly 3:55 PM. If it's past 3:59 PM it exits.
     # Multiple triggers firing the same day is fine — only the one that lands
     # in the valid window will actually run the scan.
-    - cron: '0 18,19,20 * * 1-5'
+    - cron: '0 18,20 * * 1-5'
  
   workflow_dispatch:
     inputs:
