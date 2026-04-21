@@ -252,22 +252,28 @@ def evaluate_stock(df, regime, rvol):
     passed_strategy = False
  
     # ------------------------------------------------------------------
-    # STRATEGY A: UPTREND — ADX Momentum
+    # STRATEGY A: UPTREND — Momentum (ADX as scoring bonus, not hard gate)
+    # ------------------------------------------------------------------
+    # Hard requirements — must all pass:
+    #   Close > SMA10 > SMA20  (SMA50 dropped — too slow for fast breakouts)
+    #   +DI > -DI              (direction confirmed)
+    #   RSI 45–80              (widened ceiling; strong trends run >75)
+    #   Close > EMA9           (short-term trend intact)
+    #   ADX >= 20 OR RVOL >= 2.0x  (trend strength OR volume conviction)
+    #
+    # ADX also feeds a scoring bonus so high-ADX stocks rank higher in email.
     # ------------------------------------------------------------------
     if regime == "UPTREND":
-        # Core: Price stacked above all MAs, +DI leading, ADX rising
-        ma_stack   = today['Close'] > today['SMA10'] > today['SMA20'] > today['SMA50']
-        di_leading = today['+DI'] > today['-DI']
-        adx_rising = today['ADX'] > yesterday['ADX']
-        adx_strong = today['ADX'] >= 22
- 
-        # RSI not yet overbought (still has room to run)
-        rsi_ok = 45 <= today['RSI'] <= 75
- 
-        # EMA9 acting as support (close above it = short-term trend intact)
+        ma_stack    = today['Close'] > today['SMA10'] > today['SMA20']
+        di_leading  = today['+DI'] > today['-DI']
+        rsi_ok      = 45 <= today['RSI'] <= 80
         ema_support = today['Close'] > today['EMA9']
  
-        if ma_stack and di_leading and adx_rising and adx_strong and rsi_ok and ema_support:
+        # ADX as soft signal: confirmed trend OR high volume breakout qualifies
+        adx_confirmed  = today['ADX'] >= 20 and today['ADX'] > yesterday['ADX']
+        volume_breakout = rvol >= 2.0
+ 
+        if ma_stack and di_leading and rsi_ok and ema_support and (adx_confirmed or volume_breakout):
             passed_strategy = True
  
     # ------------------------------------------------------------------
@@ -342,15 +348,19 @@ def evaluate_stock(df, regime, rvol):
     # ------------------------------------------------------------------
     try:
         if regime == "UPTREND":
-            # Historical occurrences of the same setup
+            # Mirror the relaxed strategy gate: ADX confirmed OR high volume
+            adx_col  = df['ADX']
+            rvol_col = df['Volume'] / df['Volume'].rolling(21).mean().shift(1)
             hist_mask = (
                 (df['Close'] > df['SMA10']) &
                 (df['SMA10'] > df['SMA20']) &
                 (df['+DI'] > df['-DI']) &
-                (df['ADX'] >= 22) &
-                (df['ADX'] > df['ADX'].shift(1)) &
-                (df['RSI'].between(45, 75)) &
-                (df['Close'] > df['EMA9'])
+                (df['RSI'].between(45, 80)) &
+                (df['Close'] > df['EMA9']) &
+                (
+                    ((adx_col >= 20) & (adx_col > adx_col.shift(1))) |
+                    (rvol_col >= 2.0)
+                )
             )
             forward_days = 1   # Buy close, sell next open/close
  
@@ -418,11 +428,19 @@ def evaluate_stock(df, regime, rvol):
         # Build the composite score used for final ranking
         # Consistency = 1 / (1 + std) so lower variance = higher score
         consistency = 1.0 / (1.0 + std_return)
+ 
+        # ADX bonus: rewards confirmed trends without requiring them.
+        # Scales from 0 (ADX=0, falling) to 0.10 (ADX>=30, rising).
+        adx_val   = float(today.get('ADX', 0))
+        adx_rise  = adx_val > float(yesterday.get('ADX', 0))
+        adx_bonus = min(adx_val / 30.0, 1.0) * 0.10 if adx_rise else 0.0
+ 
         score = (
             W_WIN_RATE    * (win_rate / 100) +
-            W_AVG_RETURN  * min(avg_return / 3.0, 1.0) +   # cap at 3% avg return
-            W_RVOL        * min(rvol / 3.0, 1.0) +         # cap at 3x RVOL
-            W_CONSISTENCY * consistency
+            W_AVG_RETURN  * min(avg_return / 3.0, 1.0) +
+            W_RVOL        * min(rvol / 3.0, 1.0) +
+            W_CONSISTENCY * consistency +
+            adx_bonus                              # up to +0.10 for strong rising ADX
         )
  
         metrics = {
@@ -431,6 +449,7 @@ def evaluate_stock(df, regime, rvol):
             "std_return": round(std_return, 2),
             "samples":    total,
             "rvol":       round(rvol, 2),
+            "adx":        round(adx_val, 1),
             "close_pct":  round(today['Close_Pct'] * 100, 1),
             "rsi":        round(today['RSI'], 1),
             "score":      round(score, 4),
@@ -649,6 +668,7 @@ def run_main():
                         "samples":    metrics["samples"],
                         "close_pct":  metrics["close_pct"],
                         "rsi":        metrics["rsi"],
+                        "adx":        metrics.get("adx", 0),
                         "score":      metrics["score"],
                     })
  
@@ -714,9 +734,11 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
     # Strategy explanation block — different for each regime
     strategy_notes = {
         "UPTREND": """
-            <b>Strategy:</b> ADX Momentum — stocks with a confirmed trend stack
-            (Close &gt; SMA10 &gt; SMA20 &gt; SMA50), rising ADX ≥ 22, +DI leading,
-            RSI 45–75, closing above EMA9. Backtest: <b>1-day forward return</b>.
+            <b>Strategy:</b> Momentum — Close &gt; SMA10 &gt; SMA20, +DI leading,
+            RSI 45–80, above EMA9. Qualifies on <i>either</i> ADX ≥ 20 rising
+            (confirmed trend) <i>or</i> RVOL ≥ 2.0x (volume breakout) — whichever
+            fires first. ADX adds a scoring bonus so confirmed-trend stocks rank
+            higher. Backtest: <b>1-day forward return</b>.
         """,
         "DOWNTREND": """
             <b>Strategy:</b> Relative Strength — stocks rising <i>despite</i> the market
@@ -794,3 +816,4 @@ def send_email(res_df, trade_log, port_html, ny_time, regime_msg, regime, stats)
  
 if __name__ == "__main__":
     run_main()
+ 
